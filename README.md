@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="preview.png" alt="Aria2 Web UI preview" width="700">
+</p>
+
 # Aria2 Web UI
 
 A self-contained web interface for scheduling and managing downloads with [aria2](https://aria2.github.io/).
@@ -11,6 +15,7 @@ A self-contained web interface for scheduling and managing downloads with [aria2
 - Edit scheduled tasks (URLs, destination, time)
 - Retry failed downloads individually or in bulk
 - Path autocomplete with tab completion
+- Auto path creation
 - Path history across sessions
 - Dark theme with responsive layout
 - Tab title status indicator
