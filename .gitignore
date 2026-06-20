@@ -1,0 +1,10 @@
+.env
+aria_tasks.json
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.venv/
+.DS_Store
+*.swp
+*.swo
