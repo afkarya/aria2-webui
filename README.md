@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="preview.png" alt="Aria2 Web UI preview" width="700">
+  <img src="preview.png" alt="Aria2 Web UI preview" width="70%">
 </p>
 
 # Aria2 Web UI
