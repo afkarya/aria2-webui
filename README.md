@@ -35,6 +35,32 @@ python3 aria2-webui.py
 
 Open http://localhost:5000 in your browser.
 
+## Automatic Setup (recommended for non-technical users)
+
+A single command installs everything: aria2, Python dependencies, a
+configured `.env`, and a background service that survives reboots.
+
+```bash
+git clone https://github.com/afkarya/aria2-webui.git
+cd aria2-webui
+sudo bash setup.sh
+```
+
+The script will ask you a few questions:
+
+- **Is an aria2 RPC server already running?** Say **yes** if you run one
+  yourself (e.g. the aria2 AriaNG / Aria2-AriaNg setup); you'll be asked for
+  its URL and secret. Say **no** (recommended on a fresh machine) and the app
+  starts and supervises its **own built-in aria2** — no separate server needed.
+- **Expose the web UI beyond this machine?** Say **yes** to reach it from
+  other devices on your network, or keep the default localhost-only access.
+
+It supports Debian/Ubuntu, Arch, Fedora and OpenWrt, installs into
+`/opt/aria2-webui`, and sets up a `systemd` service (a procd init script on
+OpenWrt) that auto-starts at boot. Re-run it any time to upgrade or change
+settings without losing your tasks. Use `sudo bash setup.sh --uninstall` to
+remove it.
+
 ## Configuration
 
 All settings use environment variables with defaults:
