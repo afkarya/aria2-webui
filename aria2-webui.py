@@ -61,6 +61,12 @@ _ARIA2_SECRET = os.environ.get("ARIA2_SECRET", "")
 _ARIA2_PORT = _env_int("ARIA2_PORT", 6800)
 _DB_FILE = os.environ.get("DB_FILE", "aria_tasks.json")
 _DOWNLOAD_STALL_SECONDS = _env_int("DOWNLOAD_STALL_SECONDS", 300)
+# Parallel connections per server — bypasses per-connection speed throttling
+# (tunable from the web UI, persisted to _DB_FILE)
+_SETTINGS = {
+    "connections_per_server": _env_int("CONNECTIONS_PER_SERVER", 16),
+    "min_split_size": os.environ.get("MIN_SPLIT_SIZE", "8M"),
+}
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 2 * 1024 * 1024  # 2 MB
@@ -129,8 +135,9 @@ def _start_aria2_daemon():
             f.write(f"rpc-listen-port={_ARIA2_PORT}\n")
             f.write("rpc-listen-all=false\n")
             f.write("check-certificate=false\n")
-            f.write("split=1\n")
-            f.write("max-connection-per-server=1\n")
+            f.write(f"split={_SETTINGS['connections_per_server']}\n")
+            f.write(f"max-connection-per-server={_SETTINGS['connections_per_server']}\n")
+            f.write(f"min-split-size={_SETTINGS['min_split_size']}\n")
             f.write("continue=false\n")
             f.write("allow-overwrite=true\n")
             f.write("auto-file-renaming=false\n")
@@ -158,6 +165,25 @@ def _start_aria2_daemon():
     log.error("aria2 daemon did not respond within 5 seconds.")
 
 
+def _apply_settings(data):
+    """Validate + merge new settings into the runtime _SETTINGS dict."""
+    if not isinstance(data, dict):
+        return
+    try:
+        conns = int(data.get("connections_per_server",
+                            _SETTINGS["connections_per_server"]))
+        if 1 <= conns <= 64:
+            _SETTINGS["connections_per_server"] = conns
+    except (TypeError, ValueError):
+        pass
+    try:
+        mss = str(data.get("min_split_size", _SETTINGS["min_split_size"])).strip()
+        if re.fullmatch(r"\d+[MKG]", mss, re.IGNORECASE):
+            _SETTINGS["min_split_size"] = mss.upper()
+    except (TypeError, ValueError):
+        pass
+
+
 # ── Health check (called periodically by supervisor) ─────────────────
 
 def _check_aria2_health():
@@ -176,8 +202,9 @@ def _add_uri(url, folder):
         "continue": "false",
         "allow-overwrite": "true",
         "auto-file-renaming": "false",
-        "split": "1",
-        "max-connection-per-server": "1",
+        "split": str(_SETTINGS["connections_per_server"]),
+        "max-connection-per-server": str(_SETTINGS["connections_per_server"]),
+        "min-split-size": _SETTINGS["min_split_size"],
         "check-certificate": "false",
     }
     return _rpc("aria2.addUri", [[url], options])
@@ -253,7 +280,7 @@ def _save_tasks():
         try:
             tmp = _DB_FILE + ".tmp"
             with open(tmp, "w") as f:
-                json.dump(tasks, f, indent=2)
+                json.dump({"settings": _SETTINGS, "tasks": tasks}, f, indent=2)
                 f.flush()
                 os.fsync(f.fileno())
             os.replace(tmp, _DB_FILE)
@@ -266,10 +293,16 @@ def _load_tasks():
         return
     try:
         with open(_DB_FILE, "r") as f:
-            tasks = json.load(f)
+            data = json.load(f)
     except (json.JSONDecodeError, OSError) as e:
         log.error("Corrupted task file: %s", e)
         return
+
+    if isinstance(data, dict):
+        tasks = data.get("tasks", [])
+        _apply_settings(data.get("settings", {}))
+    else:
+        tasks = data
 
     for t in tasks:
         try:
@@ -768,8 +801,30 @@ HTML_TEMPLATE = r"""
             .path-history-drop { min-width:200px; left:0; right:auto; }
         }
 
+        /* Settings gear + modal */
+        #form-card { position:relative; }
+        #settings-btn {
+            position:absolute; top:13px; right:13px;
+            width:34px; height:34px; border-radius:6px; cursor:pointer;
+            background:var(--card); color:#8b949e; font-size:1.02rem;
+            border:1px solid #30363d; line-height:1; padding:0;
+            transition:color 0.15s, border-color 0.15s;
+        }
+        #settings-btn:hover { color:var(--blue); border-color:var(--blue); }
+        .modal-overlay {
+            position:fixed; inset:0; z-index:10000; display:none;
+            background:rgba(0,0,0,0.55);
+        }
+        .modal-overlay.show { display:flex; align-items:center; justify-content:center; }
+        .modal {
+            background:var(--card); border:1px solid #30363d; border-radius:6px;
+            padding:20px; width:420px; max-width:92vw;
+            box-shadow:0 8px 24px rgba(0,0,0,0.6);
+            animation:toastIn 0.2s ease;
+        }
+
         /* Toast notifications */
-        #toast-container { position:fixed; top:16px; right:16px; z-index:9999; display:flex; flex-direction:column; gap:8px; max-width:380px; }
+        #toast-container { position:fixed; bottom:16px; right:16px; z-index:10001; display:flex; flex-direction:column; gap:8px; max-width:380px; }
         .toast {
             background:var(--card); border:1px solid #30363d; border-radius:6px;
             padding:12px 16px; font-size:0.8rem; color:var(--text);
@@ -782,7 +837,7 @@ HTML_TEMPLATE = r"""
         .toast .toast-icon { flex-shrink:0; font-size:1rem; line-height:1; }
         .toast .toast-msg  { flex:1; word-break:break-word; }
         @keyframes toastIn { from{opacity:0;transform:translateY(-10px)} to{opacity:1;transform:translateY(0)} }
-        @media (max-width:600px) { #toast-container { left:12px; right:12px; max-width:none; } }
+        @media (max-width:600px) { #toast-container { left:12px; right:12px; max-width:none; bottom:12px; } }
     </style>
 </head>
 <body>
@@ -790,6 +845,7 @@ HTML_TEMPLATE = r"""
 <div id="toast-container"></div>
 
 <div class="card" id="form-card">
+    <button id="settings-btn" title="Settings" onclick="openSettings()">&#9881;</button>
     <h2 id="form-title">NEW TASK</h2>
 
     <div class="path-input-group">
@@ -827,6 +883,30 @@ HTML_TEMPLATE = r"""
 </div>
 
 <div id="job-list"></div>
+
+<div id="settings-modal" class="modal-overlay">
+    <div class="modal">
+        <h2 style="margin:0 0 15px 0;">DOWNLOAD SETTINGS</h2>
+        <div style="display:flex;gap:10px;flex-wrap:wrap;">
+            <div style="flex:1;min-width:140px;">
+                <label style="font-size:0.75rem;color:#8b949e;display:block;margin-bottom:4px;">Connections / server</label>
+                <input type="number" id="set_conns" min="1" max="64" step="1">
+            </div>
+            <div style="flex:1;min-width:140px;">
+                <label style="font-size:0.75rem;color:#8b949e;display:block;margin-bottom:4px;">Min segment size</label>
+                <input type="text" id="set_mss" placeholder="8M">
+            </div>
+        </div>
+        <div style="margin-top:6px;color:#8b949e;font-size:0.7rem;">
+            Higher connections split each file into parallel ranges, stacking past per-connection
+            speed caps. Segment size accepts e.g. 1M, 8M, 16M. Applied to new downloads.
+        </div>
+        <div class="form-btns">
+            <button class="btn-cancel" onclick="closeSettings()">CANCEL</button>
+            <button class="btn-save" onclick="saveSettings()">SAVE</button>
+        </div>
+    </div>
+</div>
 
 <script>
     let suggestions  = [];
@@ -1248,6 +1328,54 @@ HTML_TEMPLATE = r"""
             }).join('');
     }
 
+    // ── Settings ────────────────────────────────────────
+
+    function openSettings() {
+        document.getElementById('settings-modal').classList.add('show');
+        loadSettings();
+    }
+
+    function closeSettings() {
+        document.getElementById('settings-modal').classList.remove('show');
+    }
+
+    async function loadSettings() {
+        try {
+            const res  = await safeFetch('/settings');
+            const data = await res.json();
+            const s    = data.settings || {};
+            document.getElementById('set_conns').value = s.connections_per_server || 16;
+            document.getElementById('set_mss').value    = s.min_split_size || '8M';
+        } catch {}
+    }
+
+    async function saveSettings() {
+        const conns = parseInt(document.getElementById('set_conns').value, 10);
+        const mss   = document.getElementById('set_mss').value.trim();
+        if (!conns || conns < 1 || conns > 64) {
+            showToast("Connections must be between 1 and 64.", "warning");
+            return;
+        }
+        if (!/^\d+[mMkKgG]$/.test(mss)) {
+            showToast("Segment size must look like 4M, 8M, 16M\u2026", "warning");
+            return;
+        }
+        await safeFetch('/settings', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({connections_per_server: conns, min_split_size: mss.toUpperCase()})
+        });
+        showToast('Settings saved \u2014 applies to new downloads.', 'success');
+        closeSettings();
+    }
+
+    document.getElementById('settings-modal').addEventListener('click', e => {
+        if (e.target === e.currentTarget) closeSettings();
+    });
+    document.addEventListener('keydown', e => {
+        if (e.key === 'Escape') closeSettings();
+    });
+
     adaptiveRefresh();
 </script>
 </body>
@@ -1271,6 +1399,16 @@ def health():
         "tasks": len(scheduler.get_jobs()),
         "running": any(s.get("status") == "running" for s in job_status.values()),
     })
+
+
+@app.route("/settings", methods=["GET", "POST"])
+def settings():
+    if request.method == "GET":
+        return jsonify({"settings": _SETTINGS})
+    data = request.json or {}
+    _apply_settings(data)
+    _save_tasks()
+    return jsonify({"status": "ok", "settings": _SETTINGS})
 
 
 @app.route("/autocomplete")

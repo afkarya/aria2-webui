@@ -72,6 +72,8 @@ All settings use environment variables with defaults:
 | `ARIA2_PORT` | `6800` | Port aria2c daemon listens on |
 | `DB_FILE` | `aria_tasks.json` | Task persistence file |
 | `DOWNLOAD_STALL_SECONDS` | `300` | Seconds before aborting stalled download |
+| `CONNECTIONS_PER_SERVER` | `16` | Parallel connections/server (segmented downloads bypass per-connection speed limits) |
+| `MIN_SPLIT_SIZE` | `8M` | Minimum segment size per split connection |
 | `HOST` | `127.0.0.1` | Web UI listen address |
 | `PORT` | `5000` | Web UI listen port |
 
@@ -107,6 +109,7 @@ python3 aria2-webui.py --help
 |--------|-------|-------------|
 | GET | `/` | Web UI |
 | GET | `/health` | Health check (aria2 status, task count) |
+| GET/POST | `/settings` | Read/update download settings (connections/server, segment size), persisted to task DB |
 | GET | `/jobs` | List all jobs with progress |
 | GET | `/autocomplete?term=PATH` | Path tab-completion |
 | POST | `/create_path` | Create a directory |
