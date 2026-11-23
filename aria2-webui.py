@@ -710,7 +710,7 @@ HTML_TEMPLATE = r"""
             --text:#e6edf3; --muted:#9aa7b4; --faint:#6e7b8a;
             --accent:#58a6ff; --accent-hover:#79b8ff; --accent-text:#0b1622; --accent-tint:rgba(88,166,255,.12);
             --success:#3fb950; --success-tint:rgba(63,185,80,.12);
-            --success-btn:#238636; --success-btn-hover:#2ea043;
+            --success-btn-tint:rgba(63,185,80,.2); --success-btn:#238636; --success-btn-hover:#2ea043;
             --warn:#d29922; --warn-tint:rgba(210,153,34,.12);
             --danger:#f85149; --danger-tint:rgba(248,81,73,.12);
             --violet:#a371f7; --violet-tint:rgba(163,113,247,.12);
@@ -728,7 +728,7 @@ HTML_TEMPLATE = r"""
                 --text:#1f2328; --muted:#57606a; --faint:#7d8590;
                 --accent:#0969da; --accent-hover:#0550ae; --accent-text:#ffffff; --accent-tint:rgba(9,105,218,.09);
                 --success:#1a7f37; --success-tint:rgba(26,127,55,.09);
-                --success-btn:#1f883d; --success-btn-hover:#1a7f37;
+                --success-btn-tint:rgba(26,127,55,.15); --success-btn:#1f883d; --success-btn-hover:#1a7f37;
                 --warn:#9a6700; --warn-tint:rgba(154,103,0,.09);
                 --danger:#cf222e; --danger-tint:rgba(207,34,46,.09);
                 --violet:#8250df; --violet-tint:rgba(130,80,223,.09);
@@ -904,8 +904,8 @@ HTML_TEMPLATE = r"""
         .btn--primary:hover { background:var(--accent-hover); }
         .btn--accent { background:var(--accent-tint); color:var(--accent); border-color:var(--accent); }
         .btn--accent:hover { background:var(--accent); color:var(--accent-text); }
-        .btn--start { background:var(--success-btn); border-color:var(--success-btn); color:#fff; }
-        .btn--start:hover { background:var(--success-btn-hover); border-color:var(--success-btn-hover); }
+        .btn--start { background:var(--success-btn-tint); color:var(--success); border-color:var(--success); }
+        .btn--start:hover { background:var(--success-btn); color:#fff; border-color:var(--success-btn); }
         .btn--edit { background:var(--violet-tint); color:var(--violet); border-color:var(--violet); }
         .btn--edit:hover { background:var(--violet); color:#fff; }
         .btn--retry { background:var(--cyan-tint); color:var(--cyan); border-color:var(--cyan); }
