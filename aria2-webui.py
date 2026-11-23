@@ -56,6 +56,14 @@ def _env_int(key, default):
         log.error("Invalid integer for %s=%r — using default %d", key, val, default)
         return default
 
+
+def _env_bool(key, default):
+    val = os.environ.get(key, "")
+    if not val:
+        return default
+    return val.strip().lower() in ("1", "true", "yes", "on")
+
+
 _ARIA2_RPC = os.environ.get("ARIA2_RPC", "http://localhost:6800/jsonrpc")
 _ARIA2_SECRET = os.environ.get("ARIA2_SECRET", "")
 _ARIA2_PORT = _env_int("ARIA2_PORT", 6800)
@@ -66,7 +74,22 @@ _DOWNLOAD_STALL_SECONDS = _env_int("DOWNLOAD_STALL_SECONDS", 300)
 _SETTINGS = {
     "connections_per_server": _env_int("CONNECTIONS_PER_SERVER", 16),
     "min_split_size": os.environ.get("MIN_SPLIT_SIZE", "8M"),
+    "file_allocation": os.environ.get("FILE_ALLOCATION", "none").strip().lower(),
+    "max_download_limit": os.environ.get("MAX_DOWNLOAD_LIMIT", "0").strip().upper(),
+    "max_tries": _env_int("MAX_TRIES", 5),
+    "retry_wait": _env_int("RETRY_WAIT", 0),
+    "check_certificate": _env_bool("CHECK_CERTIFICATE", False),
+    "connect_timeout": _env_int("CONNECT_TIMEOUT", 60),
+    "timeout": _env_int("TIMEOUT", 60),
+    "user_agent": os.environ.get("USER_AGENT", ""),
+    "referer": os.environ.get("REFERER", ""),
+    "remote_time": _env_bool("REMOTE_TIME", False),
 }
+
+# Reuse one TCP connection for the frequent aria2 RPC polls. A lock keeps the
+# shared session safe when the download worker and health checker overlap.
+_RPC_SESSION = requests.Session()
+_RPC_LOCK = threading.Lock()
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 2 * 1024 * 1024  # 2 MB
@@ -102,7 +125,8 @@ def _rpc(method, params=None):
         "params": [f"token:{_ARIA2_SECRET}"] + (params or []),
     }
     try:
-        r = requests.post(_ARIA2_RPC, json=payload, timeout=5)
+        with _RPC_LOCK:
+            r = _RPC_SESSION.post(_ARIA2_RPC, json=payload, timeout=5)
         r.raise_for_status()
         data = r.json()
         if "error" in data:
@@ -169,6 +193,12 @@ def _apply_settings(data):
     """Validate + merge new settings into the runtime _SETTINGS dict."""
     if not isinstance(data, dict):
         return
+
+    def as_bool(val):
+        if isinstance(val, bool):
+            return val
+        return str(val).strip().lower() in ("1", "true", "yes", "on")
+
     try:
         conns = int(data.get("connections_per_server",
                             _SETTINGS["connections_per_server"]))
@@ -182,6 +212,32 @@ def _apply_settings(data):
             _SETTINGS["min_split_size"] = mss.upper()
     except (TypeError, ValueError):
         pass
+
+    alloc = str(data.get("file_allocation", _SETTINGS["file_allocation"])).strip().lower()
+    if alloc in ("none", "prealloc", "falloc", "trunc"):
+        _SETTINGS["file_allocation"] = alloc
+
+    limit = str(data.get("max_download_limit", _SETTINGS["max_download_limit"])).strip().upper()
+    if re.fullmatch(r"(0|\d+[KMG])", limit):
+        _SETTINGS["max_download_limit"] = limit
+
+    for key, low, high in (("max_tries", 0, 64), ("retry_wait", 0, 600),
+                           ("connect_timeout", 1, 600), ("timeout", 1, 600)):
+        try:
+            num = int(data.get(key, _SETTINGS[key]))
+            if low <= num <= high:
+                _SETTINGS[key] = num
+        except (TypeError, ValueError):
+            pass
+
+    for key in ("check_certificate", "remote_time"):
+        if key in data:
+            _SETTINGS[key] = as_bool(data[key])
+
+    for key in ("user_agent", "referer"):
+        if key in data:
+            _SETTINGS[key] = str(data[key] or "").strip()
+
 
 
 # ── Health check (called periodically by supervisor) ─────────────────
@@ -205,8 +261,19 @@ def _add_uri(url, folder):
         "split": str(_SETTINGS["connections_per_server"]),
         "max-connection-per-server": str(_SETTINGS["connections_per_server"]),
         "min-split-size": _SETTINGS["min_split_size"],
-        "check-certificate": "false",
+        "file-allocation": _SETTINGS["file_allocation"],
+        "max-download-limit": _SETTINGS["max_download_limit"],
+        "max-tries": str(_SETTINGS["max_tries"]),
+        "retry-wait": str(_SETTINGS["retry_wait"]),
+        "check-certificate": "true" if _SETTINGS["check_certificate"] else "false",
+        "connect-timeout": str(_SETTINGS["connect_timeout"]),
+        "timeout": str(_SETTINGS["timeout"]),
+        "remote-time": "true" if _SETTINGS["remote_time"] else "false",
     }
+    if _SETTINGS["user_agent"]:
+        options["user-agent"] = _SETTINGS["user_agent"]
+    if _SETTINGS["referer"]:
+        options["referer"] = _SETTINGS["referer"]
     return _rpc("aria2.addUri", [[url], options])
 
 
@@ -444,6 +511,12 @@ def _run_job(job_id, urls, folder):
     with _status_lock:
         if job_id in job_status:
             retry_set = set(job_status[job_id].pop("_retry_only", []))
+            # When retrying a single link, keep the other failures so they stay
+            # visible and retryable instead of silently disappearing.
+            other_failed = [
+                u for u in job_status[job_id].get("failed", [])
+                if not retry_set or u not in retry_set
+            ]
             job_status[job_id].update({
                 "status": "running",
                 "dl_paused": False,
@@ -453,7 +526,7 @@ def _run_job(job_id, urls, folder):
                 "progress": 0,
                 "size": "",
                 "done": job_status[job_id].get("done", []),
-                "failed": [],
+                "failed": other_failed,
             })
 
     for url in urls:
@@ -623,287 +696,526 @@ signal.signal(signal.SIGINT, lambda sig, frame: sys.exit(0))
 
 HTML_TEMPLATE = r"""
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
+    <meta charset="utf-8">
     <title>Aria2 Scheduler</title>
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><rect width='16' height='16' rx='3' fill='%230d1117'/><text x='8' y='13' text-anchor='middle' font-size='12' fill='%2358a6ff'>⬇</text></svg>">
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><rect width='16' height='16' rx='3' fill='%230b0f14'/><text x='8' y='13' text-anchor='middle' font-size='12' fill='%234aa8ff'>⬇</text></svg>">
     <style>
         :root {
-            --bg:#0d1117; --card:#161b22; --text:#c9d1d9;
-            --blue:#58a6ff; --green:#3fb950; --red:#f85149;
-            --orange:#d29922; --purple:#bc8cff;
+            color-scheme: dark;
+            --bg:#0d1117; --surface:#161b22; --surface-2:#1c222b; --surface-3:#262d38;
+            --border:#30363d; --border-strong:#46505c;
+            --text:#e6edf3; --muted:#9aa7b4; --faint:#6e7b8a;
+            --accent:#58a6ff; --accent-hover:#79b8ff; --accent-text:#0b1622; --accent-tint:rgba(88,166,255,.12);
+            --success:#3fb950; --success-tint:rgba(63,185,80,.12);
+            --success-btn:#238636; --success-btn-hover:#2ea043;
+            --warn:#d29922; --warn-tint:rgba(210,153,34,.12);
+            --danger:#f85149; --danger-tint:rgba(248,81,73,.12);
+            --violet:#a371f7; --violet-tint:rgba(163,113,247,.12);
+            --cyan:#39c5cf; --cyan-tint:rgba(57,197,207,.12);
+            --radius:6px; --radius-sm:4px;
+            --font-ui:system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;
+            --font-mono:ui-monospace,SFMono-Regular,"JetBrains Mono","Cascadia Code",Consolas,monospace;
+            --xs:.76rem; --sm:.84rem; --base:.92rem; --lg:1.06rem;
         }
+        @media (prefers-color-scheme: light) {
+            :root {
+                color-scheme: light;
+                --bg:#f6f8fa; --surface:#ffffff; --surface-2:#f1f4f8; --surface-3:#e6ebf1;
+                --border:#d0d7de; --border-strong:#b6c0cc;
+                --text:#1f2328; --muted:#57606a; --faint:#7d8590;
+                --accent:#0969da; --accent-hover:#0550ae; --accent-text:#ffffff; --accent-tint:rgba(9,105,218,.09);
+                --success:#1a7f37; --success-tint:rgba(26,127,55,.09);
+                --success-btn:#1f883d; --success-btn-hover:#1a7f37;
+                --warn:#9a6700; --warn-tint:rgba(154,103,0,.09);
+                --danger:#cf222e; --danger-tint:rgba(207,34,46,.09);
+                --violet:#8250df; --violet-tint:rgba(130,80,223,.09);
+                --cyan:#1a7f87; --cyan-tint:rgba(26,127,135,.09);
+            }
+        }
+
+        * { box-sizing:border-box; }
+        [hidden] { display:none !important; }
+        html { scroll-behavior:smooth; }
         body {
-            font-family:'Consolas',monospace;
-            background:var(--bg); color:var(--text);
-            max-width:800px; margin:20px auto; padding:20px;
+            font-family:var(--font-ui); font-size:var(--base); line-height:1.5;
+            color:var(--text); background:var(--bg);
+            max-width:860px; margin:26px auto; padding:0 20px 64px;
+            -webkit-font-smoothing:antialiased;
         }
+        button, input, textarea { font:inherit; }
+        button { cursor:pointer; }
+        :focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
+        .mono { font-family:var(--font-mono); font-variant-numeric:tabular-nums; }
+        .sr-only {
+            position:absolute; width:1px; height:1px; padding:0; margin:-1px;
+            overflow:hidden; clip:rect(0,0,0,0); white-space:nowrap; border:0;
+        }
+
+        /* ── Cards ─────────────────────────────────────── */
         .card {
-            background:var(--card); padding:20px;
-            border-radius:6px; border:1px solid #30363d; margin-bottom:20px;
+            background:var(--surface); border:1px solid var(--border);
+            border-radius:var(--radius); padding:22px 24px; margin-bottom:18px;
         }
-        .card.editing {
-            border-color:var(--orange);
-            box-shadow:0 0 0 2px rgba(210,153,34,0.25);
+        .card.editing { border-color:var(--violet); }
+        .card-head { margin-bottom:20px; padding-right:44px; }
+        .card-head h2 {
+            margin:0; font-size:var(--lg); font-weight:650; color:var(--text);
         }
-        h2 {
-            color:var(--blue); margin:0 0 15px 0;
-            font-size:1rem; border-bottom:1px solid #30363d; padding-bottom:10px;
+        .card-head h2::before {
+            content:""; display:inline-block; width:7px; height:7px; border-radius:50%;
+            background:var(--accent); margin-right:9px; vertical-align:2px;
         }
-        h2.editing-title { color:var(--orange); }
+        .card.editing .card-head h2::before { background:var(--violet); }
+        .card-head p { margin:3px 0 0; font-size:var(--sm); color:var(--muted); }
 
+        .icon-btn {
+            display:inline-flex; align-items:center; justify-content:center;
+            width:34px; height:34px; padding:0; border-radius:var(--radius-sm);
+            background:var(--surface-2); border:1px solid var(--border); color:var(--muted);
+            font-size:1rem; line-height:1;
+        }
+        .icon-btn:hover { color:var(--accent); border-color:var(--accent); }
+        #settings-btn { position:absolute; top:18px; right:20px; }
+        .card--form { position:relative; }
+
+        /* ── Form fields ────────────────────────────────── */
+        .field { margin-bottom:16px; }
+        .field > label {
+            display:block; margin-bottom:7px; font-size:var(--sm); font-weight:600;
+            color:var(--muted);
+        }
+        .label-hint { font-weight:400; color:var(--faint); font-size:var(--xs); margin-left:6px; }
         input, textarea {
-            width:100%; background:#0d1117; border:1px solid #30363d;
-            color:#fff; padding:10px; border-radius:4px;
-            box-sizing:border-box; font-family:inherit;
+            width:100%; background:var(--bg); border:1px solid var(--border);
+            color:var(--text); padding:11px 12px; border-radius:var(--radius-sm);
+            font-family:var(--font-mono); font-size:var(--sm);
         }
-        input:focus, textarea:focus { outline:none; border-color:var(--blue); }
+        input::placeholder, textarea::placeholder { color:var(--faint); }
+        input:focus, textarea:focus {
+            outline:none; border-color:var(--accent);
+        }
+        textarea { resize:vertical; min-height:124px; line-height:1.65; }
+        input[type="time"] { font-family:var(--font-mono); }
 
-        /* Path input group — input + buttons as one visual unit */
+        /* Numbered link editor: gutter + roomy one-line-per-URL rows */
+        .editor {
+            display:flex; border:1px solid var(--border);
+            border-radius:var(--radius-sm); background:var(--bg); overflow:hidden;
+        }
+        .editor:focus-within { border-color:var(--accent); }
+        .editor-gutter {
+            flex:0 0 26px; padding:11px 5px; background:var(--surface-2);
+            border-right:1px solid var(--border); color:var(--faint);
+            font-family:var(--font-mono); font-size:var(--sm);
+            line-height:24px; text-align:right; overflow:hidden; user-select:none;
+        }
+        .editor-gutter span { display:block; }
+        #urls {
+            flex:1; min-width:0; border:0; border-radius:0; padding:11px 12px;
+            background:var(--bg); line-height:24px;
+            white-space:pre; overflow-x:auto; resize:vertical;
+        }
+        #urls:focus { outline:none; }
+
         .path-input-group {
             display:flex; align-items:stretch; position:relative;
-            border:1px solid #30363d; border-radius:4px;
-            background:#0d1117;
-            transition:border-color 0.2s;
+            border:1px solid var(--border); border-radius:var(--radius-sm); background:var(--bg);
         }
-        .path-input-group:focus-within { border-color:var(--blue); }
-        .path-input-group input {
-            flex:1; min-width:0;
-            border:none; background:transparent;
-            color:#fff; padding:10px; font-family:inherit;
-            font-size:inherit; outline:none;
+        .path-input-group:focus-within { border-color:var(--accent); }
+        .path-input-group input { flex:1; min-width:0; border:0; background:transparent; }
+        .path-input-group .inline-btn {
+            flex-shrink:0; border:0; border-left:1px solid var(--border);
+            background:transparent; color:var(--muted); padding:0 12px;
+            font-size:var(--xs); white-space:nowrap; user-select:none;
         }
-        .path-input-group .btn-history {
-            flex-shrink:0; border:none; border-left:1px solid #30363d;
-            border-radius:0; background:#0d1117; color:#8b949e;
-            padding:0 11px; cursor:pointer; font-size:0.8rem;
-            user-select:none; line-height:1;
-            transition:color 0.15s, background 0.15s;
-        }
-        .path-input-group .btn-history:hover { color:var(--blue); background:#161b22; }
-        .path-input-group .btn-history:only-child {
-            border-radius:0 4px 4px 0;
-        }
-        .path-input-group .btn-reuse {
-            flex-shrink:0; border:none; border-left:1px solid #30363d;
-            border-radius:0 4px 4px 0; background:#0d1117; color:var(--blue);
-            padding:0 14px; cursor:pointer; font-size:0.75rem;
-            white-space:nowrap; user-select:none;
-            transition:background 0.15s;
-        }
-        .path-input-group .btn-reuse:hover  { background:#161b22; }
-        .path-input-group .btn-reuse:active { background:#21262d; }
+        .path-input-group .inline-btn:hover { color:var(--accent); background:var(--surface-2); }
+        .path-input-group .btn-reuse { color:var(--accent); font-weight:600; }
+        .path-input-group .btn-reuse:active { background:var(--surface-3); }
 
-        /* Path history dropdown */
         .path-history-drop {
             display:none; position:absolute; top:calc(100% + 4px); right:0;
-            background:var(--card); border:1px solid #30363d;
-            border-radius:4px; z-index:10; min-width:260px;
-            box-shadow:0 4px 12px rgba(0,0,0,0.5);
-            max-height:200px; overflow-y:auto;
+            background:var(--surface); border:1px solid var(--border-strong);
+            border-radius:var(--radius-sm); z-index:20; min-width:280px; max-width:100%;
+            max-height:220px; overflow-y:auto;
         }
         .path-history-drop.show { display:block; }
         .path-history-item {
-            padding:8px 12px; cursor:pointer; font-size:0.75rem;
-            color:#8b949e; border-bottom:1px solid #21262d;
-            word-break:break-all;
+            padding:9px 12px; cursor:pointer; font-family:var(--font-mono); font-size:var(--xs);
+            color:var(--muted); border-bottom:1px solid var(--border); word-break:break-all;
         }
-        .path-history-item:last-child { border-bottom:none; }
-        .path-history-item:hover { color:var(--blue); background:#1a2030; }
+        .path-history-item:hover { color:var(--accent); background:var(--surface-2); }
         .path-history-clear {
-            padding:6px 12px; cursor:pointer; font-size:0.65rem;
-            color:var(--red); text-align:center;
+            padding:8px 12px; cursor:pointer; font-size:var(--xs); color:var(--danger);
+            text-align:center; user-select:none;
         }
-        .path-history-clear:hover { background:#1a2030; }
+        .path-history-clear:hover { background:var(--danger-tint); }
 
-        #suggestion-box { display:flex; flex-wrap:wrap; gap:6px; margin-top:8px; min-height:10px; }
-        .sugg-item {
-            background:#21262d; padding:4px 10px; border-radius:20px;
-            cursor:pointer; font-size:0.75rem; border:1px solid #30363d;
-            user-select:none;
+        .path-status {
+            display:none; align-items:center; flex-wrap:wrap; gap:8px;
+            margin-top:7px; font-size:var(--xs); color:var(--muted);
         }
-        .sugg-item:hover { border-color:var(--blue); }
-
-        #path-status { display:none; align-items:center; gap:10px; margin-top:8px; }
+        .path-status.show { display:flex; }
+        .path-status strong { color:var(--warn); font-weight:600; }
+        .path-status strong::before { content:"⚠ "; }
         .btn-create {
-            background:var(--orange); color:black; border:none;
-            padding:5px 14px; border-radius:4px; cursor:pointer;
-            font-size:0.75rem; font-weight:bold;
+            border:1px solid var(--border-strong); background:var(--surface-2);
+            color:var(--accent); padding:2px 8px; border-radius:var(--radius-sm);
+            font-size:var(--xs); font-weight:600; line-height:1.5; white-space:nowrap;
+        }
+        .btn-create:hover { border-color:var(--accent); background:var(--accent-tint); }
+
+        .suggestions { display:flex; flex-wrap:wrap; gap:6px; margin-top:9px; min-height:8px; }
+        .sugg-item {
+            background:var(--surface-2); padding:4px 10px; border-radius:20px;
+            cursor:pointer; font-family:var(--font-mono); font-size:var(--xs);
+            border:1px solid var(--border); user-select:none;
+        }
+        .sugg-item:hover { border-color:var(--accent); color:var(--accent); }
+
+        .field-foot { display:flex; justify-content:space-between; gap:12px; align-items:center; margin-top:7px; }
+        .url-count { display:flex; gap:12px; font-size:var(--xs); }
+        .url-count .total { color:var(--success); }
+        .url-count .bad { color:var(--danger); }
+        .kbd-hint { color:var(--faint); font-size:var(--xs); white-space:nowrap; }
+        kbd {
+            font-family:var(--font-mono); font-size:.95em; padding:1px 5px;
+            border:1px solid var(--border-strong); border-radius:3px; background:var(--surface-2);
         }
 
-        /* URL count indicator */
-        .url-count {
-            font-size:0.7rem; color:#8b949e; margin-top:6px;
-            display:flex; gap:12px; align-items:center;
+        .schedule-row {
+            display:grid; grid-template-columns:minmax(150px,190px) 1fr;
+            gap:14px; align-items:end; margin-top:4px;
         }
-        .url-count .invalid { color:var(--red); }
-        .url-count .total   { color:var(--green); }
+        .schedule-row .field { margin-bottom:0; }
+        .actions { display:flex; gap:10px; justify-content:flex-end; }
+        .actions .btn { flex:1; min-height:44px; }
 
-        .progress-wrap { background:#21262d; border-radius:4px; height:6px; margin-top:8px; overflow:hidden; }
-        .progress-bar  { height:100%; background:var(--green); border-radius:4px; transition:width 0.4s ease; }
-        .progress-bar.paused { background:var(--orange); }
-
-        .job-card { background:#0d1117; border-left:4px solid var(--blue); padding:12px 15px; margin-bottom:12px; border-radius:0 4px 4px 0; transition:border-color 0.2s, opacity 0.2s; }
-        .job-card.being-edited { border-left-color:var(--orange); opacity:0.6; }
-        .job-header { display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:6px; }
-        .job-footer { margin-top:8px; font-size:0.75rem; color:#8b949e; border-top:1px solid #21262d; padding-top:8px; }
-
-        .status-badge   { padding:2px 8px; border-radius:10px; font-size:0.65rem; font-weight:bold; }
-        .status-waiting   { background:#21262d; color:#8b949e; }
-        .status-queued    { background:#1f3d5a; color:var(--blue); }
-        .status-running   { background:#1f3d1a; color:var(--green); }
-        .status-paused    { background:#3d2e00; color:var(--orange); }
-        .status-dl_paused { background:#3d2e00; color:var(--orange); }
-        .status-failed    { background:#3d1a1a; color:var(--red); }
-        .status-done      { background:#1a3d2a; color:var(--green); }
-        .status-editing   { background:#3d2e00; color:var(--orange); }
-
-        .btn-row  { display:flex; gap:5px; flex-shrink:0; flex-wrap:wrap; }
-        .btn      { border:none; padding:5px 10px; border-radius:4px; cursor:pointer; font-weight:bold; font-size:0.7rem; }
-        .btn-pause-sched { background:var(--orange); color:black; }
-        .btn-dl-pause    { background:var(--orange); color:black; }
-        .btn-dl-resume   { background:var(--green);  color:black; }
-        .btn-del         { background:var(--red);    color:white; }
-        .btn-retry       { background:var(--blue);   color:black; }
-        .btn-retry-fail  { background:#1a3d5a; color:var(--blue); border:1px solid var(--blue); }
-        .btn-start       { background:var(--green);  color:black; }
-        .btn-edit        { background:var(--purple);  color:black; }
-
-        .form-btns    { display:flex; gap:10px; margin-top:12px; }
-        .btn-schedule { background:#21262d; color:var(--blue); border:1px solid var(--blue); flex:1; padding:12px; border-radius:4px; cursor:pointer; font-weight:bold; font-size:0.85rem; }
-        .btn-now      { background:var(--green);  color:black; border:none; flex:1; padding:12px; border-radius:4px; cursor:pointer; font-weight:bold; font-size:0.85rem; }
-        .btn-save     { background:var(--orange); color:black; border:none; flex:1; padding:12px; border-radius:4px; cursor:pointer; font-weight:bold; font-size:0.85rem; }
-        .btn-cancel   { background:#21262d; color:var(--red); border:1px solid var(--red); flex:1; padding:12px; border-radius:4px; cursor:pointer; font-weight:bold; font-size:0.85rem; }
-        .btn-schedule:hover { background:var(--blue); color:black; }
-        .btn-now:hover, .btn-save:hover { filter:brightness(1.15); }
-
-        .failed-url  { color:var(--red);   font-size:0.7rem; padding:2px 0; word-break:break-all; }
-        .current-url { color:var(--green); font-size:0.7rem; word-break:break-all; margin-bottom:5px; }
-        .paused-url  { color:var(--orange); font-size:0.7rem; word-break:break-all; margin-bottom:5px; }
-        .speed-line  { display:flex; justify-content:space-between; color:#8b949e; font-size:0.7rem; margin-top:5px; }
-        .edit-hint   { font-size:0.75rem; color:var(--orange); margin-top:6px; }
-
-        /* ── Responsive ─────────────────────────────── */
-        @media (max-width:600px) {
-            body { max-width:100%; margin:0; padding:12px; font-size:0.9rem; }
-            .card { padding:14px; border-radius:4px; }
-            .path-input-group { border-radius:3px; }
-            .path-input-group .btn-history,
-            .path-input-group .btn-reuse { padding:0 10px; font-size:0.7rem; }
-            .job-header { flex-direction:column; align-items:flex-start; }
-            .btn-row { width:100%; }
-            .btn { padding:6px 12px; font-size:0.72rem; flex:1; text-align:center; }
-            .form-btns { flex-direction:column; gap:8px; }
-            .btn-schedule, .btn-now, .btn-save, .btn-cancel { padding:14px; }
-            .sugg-item { font-size:0.7rem; padding:3px 8px; }
-            h2 { font-size:0.9rem; }
-            .path-history-drop { min-width:200px; left:0; right:auto; }
+        .btn {
+            display:inline-flex; align-items:center; justify-content:center; gap:6px;
+            border:1px solid transparent; padding:7px 11px; min-height:34px;
+            border-radius:var(--radius-sm); font-size:var(--sm); font-weight:600;
+            white-space:nowrap;
         }
+        .btn .ico { font-size:1em; line-height:1; }
+        .btn--primary { background:var(--accent); color:var(--accent-text); }
+        .btn--primary:hover { background:var(--accent-hover); }
+        .btn--accent { background:var(--accent-tint); color:var(--accent); border-color:var(--accent); }
+        .btn--accent:hover { background:var(--accent); color:var(--accent-text); }
+        .btn--start { background:var(--success-btn); border-color:var(--success-btn); color:#fff; }
+        .btn--start:hover { background:var(--success-btn-hover); border-color:var(--success-btn-hover); }
+        .btn--edit { background:var(--violet-tint); color:var(--violet); border-color:var(--violet); }
+        .btn--edit:hover { background:var(--violet); color:#fff; }
+        .btn--retry { background:var(--cyan-tint); color:var(--cyan); border-color:var(--cyan); }
+        .btn--retry:hover { background:var(--cyan); color:var(--accent-text); }
+        .btn--retry-outline { background:transparent; color:var(--cyan); border-color:var(--cyan); }
+        .btn--retry-outline:hover { background:var(--cyan-tint); }
+        .btn--ghost { background:var(--surface-2); color:var(--muted); border-color:var(--border-strong); }
+        .btn--ghost:hover { color:var(--text); border-color:var(--muted); }
+        .btn--warn { background:var(--warn-tint); color:var(--warn); border-color:var(--warn); }
+        .btn--warn:hover { background:var(--warn); color:var(--bg); }
+        .btn--danger { background:var(--danger-tint); color:var(--danger); border-color:var(--danger); }
+        .btn--danger:hover { background:var(--danger); color:#fff; }
+        .btn.is-armed { background:var(--danger); color:#fff; }
 
-        /* Settings gear + modal */
-        #form-card { position:relative; }
-        #settings-btn {
-            position:absolute; top:13px; right:13px;
-            width:34px; height:34px; border-radius:6px; cursor:pointer;
-            background:var(--card); color:#8b949e; font-size:1.02rem;
-            border:1px solid #30363d; line-height:1; padding:0;
-            transition:color 0.15s, border-color 0.15s;
+        /* ── Jobs ───────────────────────────────────────── */
+        #job-list { display:flex; flex-direction:column; gap:11px; }
+        .job-card {
+            background:var(--surface); border:1px solid var(--border);
+            border-left:3px solid var(--accent); border-radius:var(--radius);
+            padding:15px 17px;
         }
-        #settings-btn:hover { color:var(--blue); border-color:var(--blue); }
+        .job-card.status-running { border-left-color:var(--success); }
+        .job-card.status-paused, .job-card.status-dl_paused { border-left-color:var(--warn); }
+        .job-card.status-failed { border-left-color:var(--danger); }
+        .job-card.status-waiting, .job-card.status-queued { border-left-color:var(--faint); }
+        .job-card.being-edited { border-left-color:var(--accent); }
+        .job-top {
+            display:flex; justify-content:space-between; align-items:center;
+            flex-wrap:wrap; gap:10px;
+        }
+        .job-heading { display:flex; align-items:center; flex-wrap:wrap; gap:9px; flex:1 1 auto; min-width:0; }
+        .job-time { font-size:var(--sm); font-weight:700; color:var(--accent); }
+        .job-folder {
+            min-width:0; max-width:100%; font-size:var(--xs); color:var(--muted);
+            overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+        }
+        .job-actions { display:flex; flex:0 0 auto; gap:6px; flex-wrap:nowrap; margin-left:auto; }
+        .job-actions .btn { padding:5px 9px; min-height:32px; font-size:var(--xs); }
+        .job-sub { margin-top:7px; font-size:var(--xs); color:var(--muted); }
+        .job-sub .dot { color:var(--faint); margin:0 5px; }
+        .job-sub .eta { color:var(--accent); font-weight:600; }
+
+        .badge {
+            display:inline-flex; align-items:center; gap:5px;
+            padding:2px 9px; border-radius:20px; font-size:var(--xs); font-weight:700;
+            border:1px solid var(--border-strong); color:var(--muted); background:var(--surface-2);
+            text-transform:capitalize;
+        }
+        .badge::before { content:""; width:6px; height:6px; border-radius:50%; background:currentColor; }
+        .badge[data-status="running"] { color:var(--success); background:var(--success-tint); border-color:var(--success); }
+        .badge[data-status="queued"] { color:var(--accent); background:var(--accent-tint); border-color:var(--accent); }
+        .badge[data-status="paused"], .badge[data-status="dl_paused"] { color:var(--warn); background:var(--warn-tint); border-color:var(--warn); }
+        .badge[data-status="editing"] { color:var(--violet); background:var(--violet-tint); border-color:var(--violet); }
+        .badge[data-status="failed"] { color:var(--danger); background:var(--danger-tint); border-color:var(--danger); }
+        .badge[data-status="done"] { color:var(--success); background:var(--success-tint); border-color:var(--success); }
+
+        .job-progress { margin-top:11px; padding-top:11px; border-top:1px solid var(--border); }
+        .current-file {
+            display:flex; gap:7px; align-items:baseline; font-size:var(--xs);
+            color:var(--success); word-break:break-all; margin-bottom:8px;
+        }
+        .current-file.is-paused { color:var(--warn); }
+        .current-file .file-ico { flex-shrink:0; }
+        .progress-track { height:8px; border-radius:20px; overflow:hidden; background:var(--surface-3); }
+        .progress-fill {
+            height:100%; background:var(--success);
+            transition:width .25s linear;
+        }
+        .progress-fill.is-paused { background:var(--warn); }
+        .progress-meta {
+            display:flex; justify-content:space-between; gap:10px;
+            margin-top:7px; font-size:var(--xs); color:var(--muted);
+        }
+        .progress-meta .speed { color:var(--text); font-weight:600; }
+
+        .failed-box {
+            margin-top:10px; padding:8px 10px; border-radius:var(--radius-sm);
+            background:var(--danger-tint); border:1px solid var(--danger);
+        }
+        .failed-box summary {
+            cursor:pointer; list-style:none; font-size:var(--xs); font-weight:700;
+            color:var(--danger); user-select:none;
+        }
+        .failed-box summary::-webkit-details-marker { display:none; }
+        .failed-box summary::before { content:"▸ "; }
+        .failed-box[open] summary::before { content:"▾ "; }
+        .failed-list { list-style:none; margin:9px 0 0; padding:0; display:flex; flex-direction:column; gap:6px; }
+        .failed-list li { display:flex; align-items:center; gap:8px; font-size:var(--xs); }
+        .failed-list .url { flex:1; min-width:0; word-break:break-all; color:var(--muted); }
+        .mini-btn {
+            flex-shrink:0; min-height:28px; padding:3px 9px; border-radius:var(--radius-sm);
+            background:var(--cyan-tint); border:1px solid var(--cyan);
+            color:var(--cyan); font-size:var(--xs); font-weight:600;
+        }
+        .mini-btn:hover { background:var(--cyan); color:var(--accent-text); }
+
+        .empty { text-align:center; padding:34px 18px; color:var(--muted); }
+        .empty .empty-ico {
+            display:inline-flex; align-items:center; justify-content:center;
+            width:46px; height:46px; border-radius:var(--radius); margin-bottom:12px;
+            background:var(--accent-tint); border:1px solid var(--accent); color:var(--accent);
+            font-size:1.4rem;
+        }
+        .empty p { margin:0 0 3px; font-weight:650; color:var(--text); }
+        .empty span { font-size:var(--sm); color:var(--muted); }
+
+        /* ── Modal ──────────────────────────────────────── */
         .modal-overlay {
             position:fixed; inset:0; z-index:10000; display:none;
-            background:rgba(0,0,0,0.55);
+            background:rgba(0,0,0,.55);
         }
         .modal-overlay.show { display:flex; align-items:center; justify-content:center; }
         .modal {
-            background:var(--card); border:1px solid #30363d; border-radius:6px;
-            padding:20px; width:420px; max-width:92vw;
-            box-shadow:0 8px 24px rgba(0,0,0,0.6);
-            animation:toastIn 0.2s ease;
+            background:var(--surface); border:1px solid var(--border-strong);
+            border-radius:var(--radius); padding:22px 24px; width:440px; max-width:92vw;
+            max-height:calc(100vh - 40px); overflow-y:auto;
+        }
+        .modal-head {
+            display:flex; align-items:center; justify-content:space-between;
+            gap:12px; margin-bottom:18px;
+        }
+        .modal-head h2 { margin:0; font-size:var(--lg); font-weight:650; }
+        .field-grid { display:grid; grid-template-columns:1fr 1fr; gap:13px; }
+        select {
+            width:100%; background:var(--bg); border:1px solid var(--border);
+            color:var(--text); padding:11px 12px; border-radius:var(--radius-sm);
+            font-family:var(--font-ui); font-size:var(--sm);
+        }
+        .advanced { margin-top:14px; padding-top:13px; border-top:1px solid var(--border); }
+        .advanced summary {
+            cursor:pointer; font-size:var(--sm); font-weight:600;
+            color:var(--muted); user-select:none;
+        }
+        .advanced summary:hover { color:var(--accent); }
+        .advanced[open] .field-grid { margin-top:13px; }
+        .check-field {
+            display:flex; align-items:center; gap:9px; min-height:38px;
+            font-size:var(--sm); color:var(--muted); cursor:pointer; user-select:none;
+        }
+        .check-field input { width:auto; flex:0 0 auto; margin:0; accent-color:var(--accent); }
+        .help {
+            margin:12px 0 0; padding:10px 12px; border-radius:var(--radius-sm);
+            background:var(--surface-2); border:1px solid var(--border);
+            font-size:var(--xs); color:var(--muted); line-height:1.6;
         }
 
-        /* Toast notifications */
-        #toast-container { position:fixed; bottom:16px; right:16px; z-index:10001; display:flex; flex-direction:column; gap:8px; max-width:380px; }
-        .toast {
-            background:var(--card); border:1px solid #30363d; border-radius:6px;
-            padding:12px 16px; font-size:0.8rem; color:var(--text);
-            box-shadow:0 4px 16px rgba(0,0,0,0.5); animation:toastIn 0.25s ease;
-            display:flex; gap:10px; align-items:flex-start;
+        /* ── Toasts ─────────────────────────────────────── */
+        #toast-container {
+            position:fixed; bottom:18px; right:18px; z-index:10001;
+            display:flex; flex-direction:column; gap:9px; max-width:390px;
         }
-        .toast.error   { border-color:var(--red); }
-        .toast.warning { border-color:var(--orange); }
-        .toast.success { border-color:var(--green); }
-        .toast .toast-icon { flex-shrink:0; font-size:1rem; line-height:1; }
-        .toast .toast-msg  { flex:1; word-break:break-word; }
-        @keyframes toastIn { from{opacity:0;transform:translateY(-10px)} to{opacity:1;transform:translateY(0)} }
-        @media (max-width:600px) { #toast-container { left:12px; right:12px; max-width:none; bottom:12px; } }
+        .toast {
+            display:flex; gap:10px; align-items:flex-start;
+            background:var(--surface); border:1px solid var(--border-strong);
+            border-left:3px solid var(--accent); border-radius:var(--radius-sm);
+            padding:11px 13px; font-size:var(--sm);
+        }
+        .toast.error { border-left-color:var(--danger); }
+        .toast.warning { border-left-color:var(--warn); }
+        .toast.success { border-left-color:var(--success); }
+        .toast .toast-icon { flex-shrink:0; font-weight:700; color:var(--accent); }
+        .toast.error .toast-icon { color:var(--danger); }
+        .toast.warning .toast-icon { color:var(--warn); }
+        .toast.success .toast-icon { color:var(--success); }
+        .toast .toast-msg { flex:1; word-break:break-word; }
+        .toast .toast-close {
+            border:0; background:transparent; color:var(--faint);
+            font-size:1rem; line-height:1; padding:0 2px;
+        }
+        .toast .toast-close:hover { color:var(--text); }
+
+        /* ── Responsive ─────────────────────────────────── */
+        @media (max-width:620px) {
+            body { margin:0; padding:14px 13px 50px; }
+            .card { padding:18px 16px; border-radius:var(--radius-sm); }
+            #settings-btn { top:15px; right:16px; }
+            .card-head { padding-right:40px; }
+            .schedule-row { grid-template-columns:1fr; gap:12px; }
+            .actions .btn { min-height:42px; }
+            .job-heading { width:100%; }
+            .job-actions { width:100%; flex-wrap:wrap; margin-left:0; }
+            .job-actions .btn { flex:1; min-height:38px; padding:7px 9px; }
+            .field-foot { flex-direction:column; align-items:flex-start; gap:4px; }
+            .path-history-drop { min-width:0; left:0; right:0; }
+            .field-grid { grid-template-columns:1fr; }
+            #toast-container { left:12px; right:12px; bottom:12px; max-width:none; }
+        }
     </style>
 </head>
 <body>
 
-<div id="toast-container"></div>
+<div id="toast-container" role="status" aria-live="polite" aria-atomic="false"></div>
 
-<div class="card" id="form-card">
-    <button id="settings-btn" title="Settings" onclick="openSettings()">&#9881;</button>
-    <h2 id="form-title">NEW TASK</h2>
-
-    <div class="path-input-group">
-        <input type="text" id="dest_folder" autocomplete="off" placeholder="Destination Path  (Tab to complete)">
-        <button type="button" class="btn-history" id="btn-history"
-                title="Recent paths" onclick="togglePathHistory()">&#9660;</button>
-        <button type="button" class="btn-reuse" id="btn-reuse"
-                title="Reload last used path" onclick="reuseLastPath()" style="display:none;">
-            &#8635; Reuse
-        </button>
-        <div class="path-history-drop" id="path-history-drop"></div>
-    </div>
-    <div id="path-status">
-        <span style="font-size:0.75rem;color:#8b949e;">Path does not exist.</span>
-        <button type="button" class="btn-create" onclick="createPath()">CREATE FOLDER</button>
-    </div>
-    <div id="suggestion-box"></div>
-
-    <textarea id="urls" rows="5" style="margin-top:12px;"
-              placeholder="Paste URLs here, one per line..."></textarea>
-    <div class="url-count" id="url-count"></div>
-
-    <div style="margin-top:12px;">
-        <input type="time" id="start_time">
+<section class="card card--form" id="form-card" aria-labelledby="form-title">
+    <button id="settings-btn" class="icon-btn" type="button" title="Download settings" aria-label="Open download settings" onclick="openSettings()">⚙</button>
+    <div class="card-head">
+        <h2 id="form-title">New task</h2>
     </div>
 
-    <div class="form-btns" id="btns-normal">
-        <button class="btn-schedule" onclick="submitTask('schedule')">SCHEDULE</button>
-        <button class="btn-now"      onclick="submitTask('now')">START NOW</button>
+    <div class="field">
+        <label for="dest_folder">Destination folder<span class="label-hint">Tab to complete</span></label>
+        <div class="path-input-group">
+            <input type="text" id="dest_folder" autocomplete="off" spellcheck="false" placeholder="/home/user/Downloads" aria-describedby="path-status">
+            <button type="button" class="inline-btn" id="btn-history" title="Recent paths" aria-label="Recent paths" onclick="togglePathHistory()">▾</button>
+            <button type="button" class="inline-btn btn-reuse" id="btn-reuse" title="Reload last used path" aria-label="Reload last used path" onclick="reuseLastPath()" hidden>↻ Reuse</button>
+            <div class="path-history-drop" id="path-history-drop"></div>
+        </div>
+        <div id="path-status" class="path-status" role="status">
+            <strong>Path doesn't exist.</strong>
+            <button type="button" class="btn-create" onclick="createPath()">Create folder</button>
+        </div>
+        <div id="suggestion-box" class="suggestions" aria-label="Path suggestions"></div>
     </div>
-    <div class="form-btns" id="btns-edit" style="display:none;">
-        <button class="btn-save"   onclick="saveEdit()">SAVE CHANGES</button>
-        <button class="btn-cancel" onclick="cancelEdit()">CANCEL</button>
+
+    <div class="field">
+        <label for="urls">Download links<span class="label-hint">one per line</span></label>
+        <div class="editor" id="url-editor">
+            <div class="editor-gutter" id="url-gutter" aria-hidden="true"></div>
+            <textarea id="urls" rows="5" wrap="off" spellcheck="false" placeholder="https://example.com/file1&#10;https://example.com/file2" aria-describedby="url-count"></textarea>
+        </div>
+        <div class="field-foot">
+            <div class="url-count" id="url-count" aria-live="polite"></div>
+            <span class="kbd-hint"><kbd>Ctrl</kbd>+<kbd>Enter</kbd> to start</span>
+        </div>
     </div>
+
+    <div class="schedule-row">
+        <div class="field">
+            <label for="start_time">Start at</label>
+            <input type="time" id="start_time">
+        </div>
+        <div class="actions" id="btns-normal">
+            <button type="button" class="btn btn--accent" onclick="submitTask('schedule')"><span class="ico">◷</span> Schedule</button>
+            <button type="button" class="btn btn--start" onclick="submitTask('now')"><span class="ico">↓</span> Start now</button>
+        </div>
+        <div class="actions" id="btns-edit" hidden>
+            <button type="button" class="btn btn--ghost" onclick="cancelEdit()">Cancel</button>
+            <button type="button" class="btn btn--primary" onclick="saveEdit()"><span class="ico">✓</span> Save changes</button>
+        </div>
+    </div>
+</section>
+
+<div id="job-list" aria-label="Scheduled and active downloads">
+    <div class="empty" id="empty-state"><div class="empty-ico" aria-hidden="true">↓</div><p>No tasks yet</p><span>Paste a few links above to get started.</span></div>
 </div>
 
-<div id="job-list"></div>
-
 <div id="settings-modal" class="modal-overlay">
-    <div class="modal">
-        <h2 style="margin:0 0 15px 0;">DOWNLOAD SETTINGS</h2>
-        <div style="display:flex;gap:10px;flex-wrap:wrap;">
-            <div style="flex:1;min-width:140px;">
-                <label style="font-size:0.75rem;color:#8b949e;display:block;margin-bottom:4px;">Connections / server</label>
-                <input type="number" id="set_conns" min="1" max="64" step="1">
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="settings-title">
+        <div class="modal-head">
+            <h2 id="settings-title">Download settings</h2>
+            <button type="button" class="icon-btn" aria-label="Close settings" title="Close" onclick="closeSettings()">✕</button>
+        </div>
+        <div class="field-grid">
+            <div class="field">
+                <label for="set_conns">Connections / server</label>
+                <input type="number" id="set_conns" data-setting="connections_per_server" data-type="int" min="1" max="64" step="1">
             </div>
-            <div style="flex:1;min-width:140px;">
-                <label style="font-size:0.75rem;color:#8b949e;display:block;margin-bottom:4px;">Min segment size</label>
-                <input type="text" id="set_mss" placeholder="8M">
+            <div class="field">
+                <label for="set_mss">Min segment size</label>
+                <input type="text" id="set_mss" data-setting="min_split_size" placeholder="8M" spellcheck="false">
+            </div>
+            <div class="field">
+                <label for="set_alloc">File allocation</label>
+                <select id="set_alloc" data-setting="file_allocation">
+                    <option value="none">None — no preallocation</option>
+                    <option value="falloc">Fast (falloc)</option>
+                    <option value="prealloc">Preallocate</option>
+                    <option value="trunc">Truncate</option>
+                </select>
+            </div>
+            <div class="field">
+                <label for="set_limit">Speed limit</label>
+                <input type="text" id="set_limit" data-setting="max_download_limit" placeholder="0 = unlimited" spellcheck="false">
+            </div>
+            <div class="field">
+                <label for="set_tries">Max tries</label>
+                <input type="number" id="set_tries" data-setting="max_tries" data-type="int" min="0" max="64" step="1">
+            </div>
+            <div class="field">
+                <label for="set_retry_wait">Retry wait (s)</label>
+                <input type="number" id="set_retry_wait" data-setting="retry_wait" data-type="int" min="0" max="600" step="1">
             </div>
         </div>
-        <div style="margin-top:6px;color:#8b949e;font-size:0.7rem;">
-            Higher connections split each file into parallel ranges, stacking past per-connection
-            speed caps. Segment size accepts e.g. 1M, 8M, 16M. Applied to new downloads.
-        </div>
-        <div class="form-btns">
-            <button class="btn-cancel" onclick="closeSettings()">CANCEL</button>
-            <button class="btn-save" onclick="saveSettings()">SAVE</button>
+        <details class="advanced">
+            <summary>Advanced options</summary>
+            <div class="field-grid">
+                <label class="check-field"><input type="checkbox" data-setting="check_certificate"> Verify TLS certificates</label>
+                <label class="check-field"><input type="checkbox" data-setting="remote_time"> Preserve remote timestamps</label>
+                <div class="field">
+                    <label for="set_ctimeout">Connect timeout (s)</label>
+                    <input type="number" id="set_ctimeout" data-setting="connect_timeout" data-type="int" min="1" max="600" step="1">
+                </div>
+                <div class="field">
+                    <label for="set_timeout">Timeout (s)</label>
+                    <input type="number" id="set_timeout" data-setting="timeout" data-type="int" min="1" max="600" step="1">
+                </div>
+                <div class="field">
+                    <label for="set_ua">User-Agent</label>
+                    <input type="text" id="set_ua" data-setting="user_agent" placeholder="Default" spellcheck="false">
+                </div>
+                <div class="field">
+                    <label for="set_ref">Referer</label>
+                    <input type="text" id="set_ref" data-setting="referer" placeholder="None" spellcheck="false">
+                </div>
+            </div>
+        </details>
+        <p class="help">Connections and segment size control parallel ranges. File allocation <span class="mono">none</span> avoids preallocation delays on network storage. Speed limit accepts <span class="mono">0</span> (unlimited) or values like <span class="mono">10M</span>. Changes apply to new downloads.</p>
+        <div class="actions" style="margin-top:18px;">
+            <button type="button" class="btn btn--ghost" onclick="closeSettings()">Cancel</button>
+            <button type="button" class="btn btn--primary" onclick="saveSettings()">Save settings</button>
         </div>
     </div>
 </div>
@@ -911,6 +1223,17 @@ HTML_TEMPLATE = r"""
 <script>
     let suggestions  = [];
     let editingJobId = null;
+    let pollTimer    = null;
+    let pollBusy     = false;
+    let lastNetToast = 0;
+    let jobViews     = new Map();
+    let jobOrder     = null;
+    let renderQueued = false;
+    let pendingJobs  = null;
+    let pathTimer    = null;
+    let pathFetch    = null;
+    let lastJobs     = [];
+    let lastFocus    = null;
 
     const destInput     = document.getElementById('dest_folder');
     const suggBox       = document.getElementById('suggestion-box');
@@ -920,10 +1243,17 @@ HTML_TEMPLATE = r"""
     const btnsNormal    = document.getElementById('btns-normal');
     const btnsEdit      = document.getElementById('btns-edit');
     const urlsTextarea  = document.getElementById('urls');
+    const urlGutter     = document.getElementById('url-gutter');
     const urlCountEl    = document.getElementById('url-count');
     const pathHistDrop  = document.getElementById('path-history-drop');
+    const settingsModal = document.getElementById('settings-modal');
 
     const BASE_TITLE = 'Aria2 Scheduler';
+
+    const HTML_ESCAPES = {'&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;'};
+    function escapeHtml(str) {
+        return String(str ?? '').replace(/[&<>"']/g, c => HTML_ESCAPES[c]);
+    }
 
     // ── Path history ──────────────────────────────────────
 
@@ -951,14 +1281,9 @@ HTML_TEMPLATE = r"""
     function updateReuseButton() {
         const btn = document.getElementById('btn-reuse');
         const histBtn = document.getElementById('btn-history');
-        if (lastUsedPath) {
-            btn.style.display = '';
-            btn.title = 'Reuse: ' + lastUsedPath;
-            histBtn.style.borderRadius = '0';
-        } else {
-            btn.style.display = 'none';
-            histBtn.style.borderRadius = '0 4px 4px 0';
-        }
+        btn.hidden = !lastUsedPath;
+        btn.title = lastUsedPath ? 'Reuse: ' + lastUsedPath : '';
+        histBtn.style.borderRadius = lastUsedPath ? '0' : 'var(--radius-sm)';
     }
 
     function reuseLastPath() {
@@ -1020,45 +1345,59 @@ HTML_TEMPLATE = r"""
 
     destInput.addEventListener('input', e => checkPath(e.target.value));
 
-    async function checkPath(val) {
-        if (!val) { suggBox.innerHTML = ""; pathStatus.style.display = "none"; return; }
-        const res  = await fetch('/autocomplete?term=' + encodeURIComponent(val));
-        const data = await res.json();
-        suggestions = data.paths;
+    function checkPath(val) {
+        clearTimeout(pathTimer);
+        if (pathFetch) pathFetch.abort();
+        if (!val) {
+            suggBox.innerHTML = '';
+            pathStatus.classList.remove('show');
+            return;
+        }
+        // Debounce + abort: typing stays snappy and stale results can't
+        // overwrite the suggestions for the current value.
+        pathTimer = setTimeout(async () => {
+            pathFetch = new AbortController();
+            try {
+                const res  = await fetch('/autocomplete?term=' + encodeURIComponent(val), {signal: pathFetch.signal});
+                const data = await res.json();
+                if (destInput.value !== val) return;
+                suggestions = data.paths;
 
-        suggBox.innerHTML = suggestions.map(s => {
-            const label = s.split('/').filter(x => x).pop() || s;
-            return '<span class="sugg-item" data-path="' + escapeHtml(s) + '">' + escapeHtml(label) + '</span>';
-        }).join('');
+                suggBox.innerHTML = suggestions.map(s => {
+                    const label = s.split('/').filter(x => x).pop() || s;
+                    return '<button type="button" class="sugg-item" data-path="' + escapeHtml(s) + '">' + escapeHtml(label) + '</button>';
+                }).join('');
 
-        suggBox.querySelectorAll('.sugg-item').forEach(el => {
-            el.addEventListener('mousedown', e => {
-                e.preventDefault();
-                destInput.value = el.dataset.path;
-                checkPath(el.dataset.path);
-            });
-        });
+                suggBox.querySelectorAll('.sugg-item').forEach(el => {
+                    el.addEventListener('mousedown', e => {
+                        e.preventDefault();
+                        destInput.value = el.dataset.path;
+                        checkPath(el.dataset.path);
+                    });
+                });
 
-        pathStatus.style.display = (!data.exists && suggestions.length === 0) ? "flex" : "none";
+                pathStatus.classList.toggle('show', !data.exists && suggestions.length === 0);
+            } catch (e) {
+                if (e.name !== 'AbortError') pathStatus.classList.remove('show');
+            }
+        }, 130);
     }
 
-    function escapeHtml(str) {
-        const div = document.createElement('div');
-        div.appendChild(document.createTextNode(str));
-        return div.innerHTML;
-    }
+    // ── Toasts ───────────────────────────────────────────
 
     function showToast(msg, type) {
         type = type || 'error';
-        const icons = {error:'\u2717', warning:'\u26A0', success:'\u2713'};
+        const icons = {error:'✕', warning:'⚠', success:'✓'};
         const container = document.getElementById('toast-container');
         const toast = document.createElement('div');
         toast.className = 'toast ' + type;
-        toast.innerHTML = '<span class="toast-icon">' + icons[type] + '</span>' +
-                          '<span class="toast-msg">' + escapeHtml(msg) + '</span>';
+        toast.innerHTML =
+            '<span class="toast-icon" aria-hidden="true">' + icons[type] + '</span>' +
+            '<span class="toast-msg">' + escapeHtml(msg) + '</span>' +
+            '<button type="button" class="toast-close" aria-label="Dismiss notification">✕</button>';
+        toast.querySelector('.toast-close').addEventListener('click', () => toast.remove());
         container.appendChild(toast);
-        setTimeout(() => { toast.style.opacity = '0'; toast.style.transition = 'opacity 0.3s'; }, 3500);
-        setTimeout(() => toast.remove(), 3800);
+        setTimeout(() => toast.remove(), 3900);
     }
 
     async function safeFetch(url, opts) {
@@ -1070,10 +1409,16 @@ HTML_TEMPLATE = r"""
             }
             return res;
         } catch (e) {
-            if (e.name === 'TypeError' && e.message.includes('fetch')) {
-                showToast('Cannot reach server. Is the app running?', 'error');
-            } else {
-                showToast(e.message, 'error');
+            // Polling can fail repeatedly when the server restarts; don't
+            // stack a toast on every attempt.
+            const now = Date.now();
+            if (now - lastNetToast > 20000) {
+                lastNetToast = now;
+                if (e.name === 'TypeError' && e.message.includes('fetch')) {
+                    showToast('Cannot reach server. Is the app running?', 'error');
+                } else {
+                    showToast(e.message, 'error');
+                }
             }
             throw e;
         }
@@ -1100,16 +1445,38 @@ HTML_TEMPLATE = r"""
     function updateUrlCount() {
         const urls = getUrls();
         const total = urls.length;
-        const valid = urls.filter(isValidUrl).length;
-        const invalid = total - valid;
+        const invalid = urls.filter(u => !isValidUrl(u)).length;
         if (!total) { urlCountEl.innerHTML = ''; return; }
-        let html = '<span class="total">' + total + ' URL' + (total !== 1 ? 's' : '') + '</span>';
-        if (invalid) html += '<span class="invalid">' + invalid + ' invalid</span>';
+        let html = '<span class="total">' + total + ' link' + (total !== 1 ? 's' : '') + '</span>';
+        if (invalid) html += '<span class="bad">' + invalid + ' invalid</span>';
         urlCountEl.innerHTML = html;
     }
 
-    urlsTextarea.addEventListener('input', updateUrlCount);
-    urlsTextarea.addEventListener('paste', () => setTimeout(updateUrlCount, 50));
+    function updateGutter() {
+        const count = Math.max(1, urlsTextarea.value.split('\n').length);
+        let html = '';
+        for (let i = 1; i <= count; i++) html += '<span>' + i + '</span>';
+        urlGutter.innerHTML = html;
+        urlGutter.style.flexBasis = Math.max(26, String(count).length * 9 + 10) + 'px';
+        urlGutter.scrollTop = urlsTextarea.scrollTop;
+    }
+
+    urlsTextarea.addEventListener('input', () => { updateGutter(); updateUrlCount(); });
+    urlsTextarea.addEventListener('scroll', () => { urlGutter.scrollTop = urlsTextarea.scrollTop; });
+    urlsTextarea.addEventListener('paste', () => setTimeout(() => {
+        // Browsers scroll long lines to reveal the caret after a paste —
+        // snap back so the start of the links stays visible next to the
+        // line numbers.
+        urlsTextarea.scrollLeft = 0;
+        updateGutter();
+        updateUrlCount();
+    }, 50));
+    urlsTextarea.addEventListener('keydown', e => {
+        if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
+            e.preventDefault();
+            submitTask(document.getElementById('start_time').value ? 'schedule' : 'now');
+        }
+    });
 
     // ── Edit mode ────────────────────────────────────────
 
@@ -1117,16 +1484,15 @@ HTML_TEMPLATE = r"""
         editingJobId = job.id;
         destInput.value = job.folder;
         urlsTextarea.value = job.urls.join('\n');
-
-        document.getElementById('start_time').value = (job.time === "NOW" ? "" : job.time);
+        document.getElementById('start_time').value = (job.time === 'NOW' ? '' : job.time);
 
         formCard.classList.add('editing');
-        formTitle.textContent = 'EDITING TASK';
-        formTitle.classList.add('editing-title');
-        btnsNormal.style.display = 'none';
-        btnsEdit.style.display   = 'flex';
+        formTitle.textContent = 'Editing task';
+        btnsNormal.hidden = true;
+        btnsEdit.hidden = false;
         window.scrollTo({top: 0, behavior: 'smooth'});
         checkPath(job.folder);
+        updateGutter();
         updateUrlCount();
         refreshJobs();
     }
@@ -1135,10 +1501,9 @@ HTML_TEMPLATE = r"""
         editingJobId = null;
         clearForm();
         formCard.classList.remove('editing');
-        formTitle.textContent = 'NEW TASK';
-        formTitle.classList.remove('editing-title');
-        btnsNormal.style.display = 'flex';
-        btnsEdit.style.display   = 'none';
+        formTitle.textContent = 'New task';
+        btnsNormal.hidden = false;
+        btnsEdit.hidden = true;
         refreshJobs();
     }
 
@@ -1147,23 +1512,22 @@ HTML_TEMPLATE = r"""
         urlsTextarea.value = '';
         document.getElementById('start_time').value = '';
         suggBox.innerHTML = '';
-        pathStatus.style.display = 'none';
+        pathStatus.classList.remove('show');
+        urlGutter.innerHTML = '';
         urlCountEl.innerHTML = '';
     }
 
     async function saveEdit() {
         const folder = destInput.value.trim();
         const urls   = urlsTextarea.value.trim();
+        if (!folder) { showToast('Please enter a destination path.', 'warning'); return; }
+        if (!urls)   { showToast('Please enter at least one link.', 'warning'); return; }
 
-        if (!folder) { showToast("Please enter a destination path.", "warning"); return; }
-        if (!urls)   { showToast("Please enter at least one URL.", "warning");   return; }
-
-        await safeFetch('/edit/' + editingJobId, {
+        await safeFetch('/edit/' + encodeURIComponent(editingJobId), {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({dest_folder: folder, urls: urls, start_time: document.getElementById('start_time').value})
         });
-
         recordPathUsed(folder);
         cancelEdit();
     }
@@ -1174,10 +1538,9 @@ HTML_TEMPLATE = r"""
         const folder = destInput.value.trim();
         const urls   = urlsTextarea.value.trim();
         const t      = document.getElementById('start_time').value;
-
-        if (!folder) { showToast("Please enter a destination path.", "warning"); return; }
-        if (!urls)   { showToast("Please enter at least one URL.", "warning");   return; }
-        if (mode === 'schedule' && !t) { showToast("Please select a time.", "warning"); return; }
+        if (!folder) { showToast('Please enter a destination path.', 'warning'); return; }
+        if (!urls)   { showToast('Please enter at least one link.', 'warning'); return; }
+        if (mode === 'schedule' && !t) { showToast('Please select a time.', 'warning'); return; }
 
         await safeFetch('/schedule', {
             method: 'POST',
@@ -1189,197 +1552,506 @@ HTML_TEMPLATE = r"""
                 start_now:   mode === 'now'
             })
         });
-
         recordPathUsed(folder);
         clearForm();
         refreshJobs();
     }
 
-    // ── Job list ─────────────────────────────────────────
+    // ── Time helpers ─────────────────────────────────────
 
-    function badge(status) {
-        return '<span class="status-badge status-' + status + '">' + status.toUpperCase() + '</span>';
+    const BYTE_UNITS = {B:1, KB:1024, MB:1024**2, GB:1024**3, TB:1024**4};
+
+    function parseBytes(text) {
+        const m = String(text || '').trim().match(/^([\d.,]+)\s*(B|KB|MB|GB|TB)$/i);
+        if (!m) return 0;
+        return parseFloat(m[1].replace(/,/g, '')) * BYTE_UNITS[m[2].toUpperCase()];
     }
 
-    async function refreshJobs() {
-        try {
-            const res  = await safeFetch('/jobs');
-            const jobs = await res.json();
-            refreshJobsInner(jobs);
-        } catch {}
+    function parseSpeed(text) {
+        const m = String(text || '').trim().match(/^([\d.,]+)\s*(B|KB|MB|GB|TB)\/s$/i);
+        return m ? parseFloat(m[1].replace(/,/g, '')) * BYTE_UNITS[m[2].toUpperCase()] : 0;
+    }
+
+    function durationWords(seconds, maxUnits) {
+        seconds = Math.max(0, Math.round(seconds));
+        const days = Math.floor(seconds / 86400); seconds %= 86400;
+        const hours = Math.floor(seconds / 3600); seconds %= 3600;
+        const mins = Math.floor(seconds / 60);
+        const parts = [];
+        if (days) parts.push(days + 'd');
+        if (hours) parts.push(hours + 'h');
+        if (mins) parts.push(mins + 'm');
+        if (!parts.length) parts.push(Math.max(1, seconds) + 's');
+        return parts.slice(0, maxUnits || 2).join(' ');
+    }
+
+    function etaOf(j) {
+        if (j.status !== 'running') return '';
+        const speed = parseSpeed(j.speed);
+        if (!speed) return '';
+        const parts = String(j.size || '').split('/');
+        const done  = parseBytes(parts[0]);
+        const total = parseBytes(parts[1] || parts[0]);
+        let remaining = total > done ? total - done : 0;
+        const pct = parseFloat(j.progress);
+        if (!remaining && pct > 0 && pct < 100 && total > 0) remaining = total * (100 - pct) / 100;
+        if (!remaining) return '';
+        return '~' + durationWords(remaining / speed);
+    }
+
+    function countdownText(j) {
+        if (j.status !== 'waiting' && j.status !== 'queued') return '';
+        if (j.sched_paused) return 'Schedule paused';
+        if (j.time === 'NOW') return 'Starting shortly';
+        const [h, m] = j.time.split(':').map(Number);
+        if (!Number.isFinite(h) || !Number.isFinite(m)) return '';
+        const now = new Date();
+        const target = new Date(now);
+        target.setHours(h, m, 0, 0);
+        if (target <= now) target.setDate(target.getDate() + 1);
+        return 'in ' + durationWords((target - now) / 1000);
+    }
+
+    // ── Job list ─────────────────────────────────────────
+
+    const ICONS = {
+        start_now:'▶', pause:'⏸', resume:'▶', dl_pause:'⏸', dl_resume:'▶',
+        edit:'✎', del:'✕', retry:'↻', retry_failed:'↻'
+    };
+
+    function actionBtn(id, action, label, cls) {
+        return '<button type="button" class="btn ' + cls + '" ' +
+               'aria-label="' + escapeHtml(label + ' (' + id + ')') + '" ' +
+               'onclick="control(\'' + escapeHtml(id) + '\',\'' + action + '\')">' +
+               '<span class="ico" aria-hidden="true">' + ICONS[action] + '</span>' + escapeHtml(label) + '</button>';
+    }
+
+    function jobSignature(j) {
+        return [j.time, j.folder, j.status, j.url_total, j.done_count,
+                j.sched_paused, j.failed_urls.join('|'), j.id === editingJobId].join('\u0001');
+    }
+
+    function jobButtons(j) {
+        const isRunning = j.status === 'running';
+        const isPaused  = j.status === 'paused' || j.status === 'dl_paused';
+        const isFailed  = j.status === 'failed';
+        const isWaiting = j.status === 'waiting' || j.status === 'queued';
+        const isActive  = isRunning || isPaused;
+        if (j.id === editingJobId) return '';
+
+        let btns = '';
+        if (isWaiting) {
+            btns += actionBtn(j.id, 'start_now', 'Start now', 'btn--start');
+            btns += actionBtn(j.id, 'pause', j.sched_paused ? 'Resume schedule' : 'Pause schedule', 'btn--warn');
+        }
+        if (isRunning) btns += actionBtn(j.id, 'dl_pause', 'Pause', 'btn--warn');
+        if (isPaused)  btns += actionBtn(j.id, 'dl_resume', 'Resume', 'btn--start');
+        if (!isActive) {
+            btns += '<button type="button" class="btn btn--edit" aria-label="Edit task ' + escapeHtml(j.id) + '" ' +
+                    'onclick="editJob(\'' + escapeHtml(j.id) + '\')"><span class="ico" aria-hidden="true">✎</span>Edit</button>';
+        }
+        btns += '<button type="button" class="btn btn--danger" data-armed="0" aria-label="Delete task ' + escapeHtml(j.id) + '" ' +
+                'onclick="armDelete(\'' + escapeHtml(j.id) + '\',this)"><span class="ico" aria-hidden="true">✕</span>Delete</button>';
+        if (isFailed) {
+            btns += actionBtn(j.id, 'retry', 'Retry', 'btn--retry');
+            if (j.failed_urls.length && j.done_count > 0) {
+                btns += actionBtn(j.id, 'retry_failed', 'Retry failed', 'btn--retry-outline');
+            }
+        }
+        return btns;
+    }
+
+    function failedHTML(j) {
+        if (j.status !== 'failed' || !j.failed_urls.length) {
+            return '<div class="failed-box" data-role="failed" hidden></div>';
+        }
+        return `<details class="failed-box" data-role="failed">
+            <summary>${j.failed_urls.length} failed link${j.failed_urls.length !== 1 ? 's' : ''} — click to expand</summary>
+            <ul class="failed-list">
+                ${j.failed_urls.map(u =>
+                    '<li><span class="url">' + escapeHtml(u) + '</span>' +
+                    '<button type="button" class="mini-btn" aria-label="Retry link ' + escapeHtml(u) + '" ' +
+                    'onclick="retryUrl(\'' + escapeHtml(j.id) + '\',this.dataset.u)" data-u="' + escapeHtml(u) + '">Retry</button></li>'
+                ).join('')}
+            </ul>
+        </details>`;
+    }
+
+    function cardHTML(j) {
+        const isRunning  = j.status === 'running';
+        const isPaused   = j.status === 'paused' || j.status === 'dl_paused';
+        const isFailed   = j.status === 'failed';
+        const isActive   = isRunning || isPaused;
+        const isEditing  = j.id === editingJobId;
+        const showFailed = Boolean(isFailed && j.failed_urls.length);
+        const statusLabel = isEditing ? 'editing' : j.status;
+        const pct = parseFloat(j.progress) || 0;
+
+        return `
+        <article class="job-card status-${escapeHtml(j.status)} ${isEditing ? 'being-edited' : ''}" data-job-id="${escapeHtml(j.id)}">
+            <div class="job-top">
+                <div class="job-heading">
+                    <span class="job-time mono" data-role="time">[${escapeHtml(j.time)}]</span>
+                    <span class="badge" data-role="badge" data-status="${escapeHtml(statusLabel)}">${escapeHtml(statusLabel.replace('_', ' '))}</span>
+                    <span class="job-folder mono" data-role="folder" title="${escapeHtml(j.folder)}">${escapeHtml(j.folder)}</span>
+                </div>
+                <div class="job-actions" data-role="actions">${jobButtons(j)}</div>
+            </div>
+            <div class="job-sub" data-role="header-sub" ${countdownText(j) ? '' : 'hidden'}>
+                <span class="eta" data-role="countdown"></span>
+            </div>
+            <div class="job-progress" data-role="progress-block" ${isActive || showFailed ? '' : 'hidden'}>
+                <div class="download-stats" data-role="stats" ${isActive ? '' : 'hidden'}>
+                    <div class="current-file mono ${isPaused ? 'is-paused' : ''}" data-role="file">
+                        <span class="file-ico" aria-hidden="true">${isPaused ? '⏸' : '↓'}</span>
+                        <span>${escapeHtml(j.current_file || j.current_url || 'Waiting for file…')}</span>
+                    </div>
+                    <div class="progress-track" role="progressbar" aria-label="Download progress"
+                         aria-valuemin="0" aria-valuemax="100" aria-valuenow="${pct}" data-role="bar-wrap">
+                        <div class="progress-fill ${isPaused ? 'is-paused' : ''}" style="width:${pct}%" data-role="bar"></div>
+                    </div>
+                    <div class="progress-meta">
+                        <span><span data-role="pct">${pct}%</span> <span class="dot">·</span> <span data-role="size">${escapeHtml(j.size || '—')}</span></span>
+                        <span class="speed" data-role="speed">${isPaused ? 'Paused' : escapeHtml(j.speed || '0 B/s')}</span>
+                    </div>
+                    <div class="job-sub" data-role="detail"></div>
+                </div>
+                ${failedHTML(j)}
+            </div>
+        </article>`;
+    }
+
+    // Index a card's data-role nodes once so polling never runs a selector
+    // query per field. Only the rare failed-box replacement needs a re-query.
+    function indexRoles(el) {
+        const map = new Map();
+        el.querySelectorAll('[data-role]').forEach(n => map.set(n.dataset.role, n));
+        return map;
+    }
+
+    function setText(view, name, text) {
+        const node = view.roles.get(name);
+        if (node) node.textContent = text;
+    }
+
+    function updateJobDynamic(view, j) {
+        const q = name => view.roles.get(name);
+        const isPaused = j.status === 'paused' || j.status === 'dl_paused';
+        const active = j.status === 'running' || isPaused;
+
+        const block = q('progress-block');
+        if (block) block.hidden = !(active || (j.status === 'failed' && j.failed_urls.length));
+        const stats = q('stats');
+        if (stats) stats.hidden = !active;
+        const countdown = countdownText(j);
+        setText(view, 'countdown', countdown);
+        const headerSub = q('header-sub');
+        if (headerSub) headerSub.hidden = !countdown;
+
+        if (!active) return;
+        const pct = parseFloat(j.progress) || 0;
+        const bar = q('bar');
+        if (bar) {
+            bar.style.width = pct + '%';
+            bar.classList.toggle('is-paused', isPaused);
+        }
+        const wrap = q('bar-wrap');
+        if (wrap) wrap.setAttribute('aria-valuenow', String(Math.round(pct)));
+        const file = q('file');
+        if (file) {
+            file.classList.toggle('is-paused', isPaused);
+            const ico = file.querySelector('.file-ico');
+            if (ico) ico.textContent = isPaused ? '⏸' : '↓';
+            file.lastElementChild.textContent = ' ' + (j.current_file || j.current_url || 'Waiting for file…');
+        }
+        setText(view, 'pct', pct + '%');
+        setText(view, 'size', j.size || '—');
+        setText(view, 'speed', isPaused ? 'Paused' : (j.speed || '0 B/s'));
+        const eta = etaOf(j);
+        setText(view, 'detail', (j.done_count || 0) + ' / ' + j.url_total + ' files done' + (eta ? ' · ETA ' + eta : ''));
+    }
+
+    // Patch a card in place — never replace the whole node, so focus,
+    // scroll position and open <details> survive a refresh.
+    function patchJob(view, j) {
+        const el = view.el;
+        const q = name => view.roles.get(name);
+        const sig = jobSignature(j);
+        if (sig !== view.sig) {
+            const isEditing = j.id === editingJobId;
+            const status = isEditing ? 'editing' : j.status;
+            el.className = 'job-card status-' + j.status + (isEditing ? ' being-edited' : '');
+            setText(view, 'time', '[' + j.time + ']');
+            const b = q('badge');
+            if (b) { b.dataset.status = status; b.textContent = status.replace('_', ' '); }
+            const folder = q('folder');
+            if (folder) { folder.textContent = j.folder; folder.title = j.folder; }
+            const actions = q('actions');
+            if (actions) actions.innerHTML = jobButtons(j);
+            const failed = q('failed');
+            if (failed) {
+                failed.outerHTML = failedHTML(j);
+                const fresh = el.querySelector('[data-role="failed"]');
+                if (fresh) view.roles.set('failed', fresh);
+            }
+            view.sig = sig;
+        }
+        updateJobDynamic(view, j);
+    }
+
+    function renderJobsNow(jobs) {
+        const list = document.getElementById('job-list');
+        document.getElementById('empty-state').hidden = jobs.length > 0;
+        const ids = jobs.map(j => j.id).join('|');
+
+        if (ids !== jobOrder) {
+            const present = new Set(jobs.map(j => j.id));
+            for (const [id, view] of jobViews) {
+                if (!present.has(id)) { view.el.remove(); jobViews.delete(id); }
+            }
+            jobs.forEach((j, index) => {
+                let view = jobViews.get(j.id);
+                if (!view) {
+                    const holder = document.createElement('div');
+                    holder.innerHTML = cardHTML(j);
+                    const node = holder.firstElementChild;
+                    view = {el: node, sig: null, roles: indexRoles(node)};
+                    jobViews.set(j.id, view);
+                }
+                const ref = list.children[index + 1] || null; // empty-state is child 0
+                if (view.el !== ref) list.insertBefore(view.el, ref);
+            });
+            jobOrder = ids;
+        }
+
+        jobs.forEach(j => {
+            const view = jobViews.get(j.id);
+            if (view) patchJob(view, j);
+        });
+    }
+
+    // Coalesce renders triggered by multiple responses in the same frame.
+    function refreshJobsInner(jobs) {
+        pendingJobs = jobs;
+        if (renderQueued) return;
+        renderQueued = true;
+        requestAnimationFrame(() => {
+            renderQueued = false;
+            renderJobsNow(pendingJobs);
+        });
+        // rAF can be suspended for occluded windows — don't let updates stall.
+        setTimeout(() => {
+            if (renderQueued) {
+                renderQueued = false;
+                renderJobsNow(pendingJobs);
+            }
+        }, 120);
+    }
+
+    function disarm(btn) {
+        if (!btn.dataset.armed) return;
+        delete btn.dataset.armed;
+        btn.classList.remove('is-armed');
+        if (btn.dataset.prevHTML) btn.innerHTML = btn.dataset.prevHTML;
+        delete btn.dataset.prevHTML;
+    }
+
+    function disarmAll() {
+        document.querySelectorAll('.btn[data-armed]').forEach(disarm);
+    }
+
+    function armDelete(id, btn) {
+        if (btn.dataset.armed === '1') {
+            control(id, 'delete');
+            return;
+        }
+        disarmAll();
+        btn.dataset.armed = '1';
+        btn.dataset.prevHTML = btn.innerHTML;
+        btn.classList.add('is-armed');
+        btn.textContent = 'Confirm delete?';
+        btn.setAttribute('aria-label', 'Click again to confirm delete of ' + id);
+        setTimeout(() => { if (btn.isConnected) disarm(btn); }, 4000);
+    }
+
+    function retryUrl(id, url) {
+        control(id, 'retry_url', {url: url});
     }
 
     async function editJob(id) {
-        try {
-            const res  = await safeFetch('/jobs');
-            const jobs = await res.json();
-            const job  = jobs.find(j => j.id === id);
-            if (job) enterEditMode(job);
-        } catch {}
+        let job = lastJobs.find(j => j.id === id);
+        if (!job) {
+            try {
+                const res = await safeFetch('/jobs');
+                job = (await res.json()).find(j => j.id === id);
+            } catch { return; }
+        }
+        if (job) enterEditMode(job);
     }
 
-    async function control(id, action) {
+    async function control(id, action, payload) {
+        disarmAll();
+        const opts = {method: 'POST'};
+        if (payload) {
+            opts.headers = {'Content-Type': 'application/json'};
+            opts.body = JSON.stringify(payload);
+        }
         try {
-            await safeFetch('/control/' + action + '/' + id, {method: 'POST'});
+            await safeFetch('/control/' + action + '/' + encodeURIComponent(id), opts);
         } catch {}
         refreshJobs();
     }
 
     function updateTabTitle(jobs) {
-        const running  = jobs.filter(j => j.status === 'running').length;
-        const paused   = jobs.filter(j => j.status === 'paused' || j.status === 'dl_paused').length;
-        const failed   = jobs.filter(j => j.status === 'failed').length;
+        let running = 0, paused = 0, failed = 0;
+        for (const j of jobs) {
+            if (j.status === 'running') running++;
+            else if (j.status === 'paused' || j.status === 'dl_paused') paused++;
+            else if (j.status === 'failed') failed++;
+        }
         let prefix = '';
-        if (running)      prefix = '\u2B07 ';  // ⬇
-        else if (paused)  prefix = '\u23F8 ';  // ⏸
-        else if (failed)  prefix = '\u2717 ';  // ✗
-        document.title = prefix + BASE_TITLE;
+        if (running)     prefix = '⬇ ';
+        else if (paused) prefix = '⏸ ';
+        else if (failed) prefix = '✗ ';
+        const title = prefix + BASE_TITLE;
+        if (document.title !== title) document.title = title;
     }
 
-    async function adaptiveRefresh() {
+    // ── Polling (one chain, never overlapping requests) ───
+
+    async function loadJobs() {
+        if (pollBusy) return null;
+        pollBusy = true;
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 8000);
         try {
-            const res  = await safeFetch('/jobs');
+            const res = await safeFetch('/jobs', {signal: controller.signal});
             const jobs = await res.json();
+            lastJobs = jobs;
             refreshJobsInner(jobs);
             updateTabTitle(jobs);
-            const busy = jobs.some(j => j.status === 'running' || j.status === 'paused' || j.status === 'dl_paused');
-            setTimeout(adaptiveRefresh, busy ? 800 : 4000);
+            return jobs;
         } catch {
-            setTimeout(adaptiveRefresh, 6000);
+            return null;
+        } finally {
+            clearTimeout(timeout);
+            pollBusy = false;
         }
     }
 
-    function refreshJobsInner(jobs) {
-        document.getElementById('job-list').innerHTML = jobs.length === 0
-            ? '<div style="color:#555;text-align:center;padding:20px;">No tasks scheduled.</div>'
-            : jobs.map(j => {
-                const isRunning  = j.status === 'running';
-                const isPaused   = j.status === 'paused' || j.status === 'dl_paused';
-                const isFailed   = j.status === 'failed';
-                const isWaiting  = j.status === 'waiting' || j.status === 'queued';
-                const isActive   = isRunning || isPaused;
-                const isEditing  = j.id === editingJobId;
-                const hasBoth    = isFailed && j.failed_urls.length && j.done_count > 0;
-
-                const progressSection = isActive ? `
-                    <div class="${isPaused ? 'paused-url' : 'current-url'}">
-                        ${isPaused ? '&#9646;&#9646;' : '&#8595;'} ${escapeHtml(j.current_file || j.current_url)}
-                    </div>
-                    <div class="progress-wrap">
-                        <div class="progress-bar ${isPaused ? 'paused' : ''}"
-                             style="width:${parseFloat(j.progress) || 0}%"></div>
-                    </div>
-                    <div class="speed-line">
-                        <span>${parseFloat(j.progress) || 0}%  &mdash;  ${escapeHtml(j.size)}</span>
-                        <span>${isPaused ? 'PAUSED' : escapeHtml(j.speed)}</span>
-                    </div>
-                    <div style="margin-top:6px;color:#8b949e;font-size:0.7rem">
-                        ${j.done_count} / ${j.url_total} files done
-                    </div>` : '';
-
-                const failedSection = isFailed && j.failed_urls.length ? `
-                    <div style="color:var(--red);margin-bottom:4px;">Failed URLs:</div>
-                    ${j.failed_urls.map(u => '<div class="failed-url">&times; ' + escapeHtml(u) + '</div>').join('')}` : '';
-
-                const editHint = isEditing
-                    ? '<div class="edit-hint">&#9998; Currently being edited&hellip;</div>' : '';
-
-                let btns = '';
-                if (!isEditing) {
-                    if (isWaiting) {
-                        btns += '<button class="btn btn-start" onclick="control(\'' + j.id + '\',\'start_now\')">START NOW</button>';
-                        btns += '<button class="btn btn-pause-sched" onclick="control(\'' + j.id + '\',\'pause\')">' + (j.sched_paused ? 'RESUME' : 'PAUSE') + '</button>';
-                    }
-                    if (isRunning) {
-                        btns += '<button class="btn btn-dl-pause" onclick="control(\'' + j.id + '\',\'dl_pause\')">PAUSE DL</button>';
-                    }
-                    if (isPaused) {
-                        btns += '<button class="btn btn-dl-resume" onclick="control(\'' + j.id + '\',\'dl_resume\')">RESUME DL</button>';
-                    }
-                    if (!isActive) {
-                        btns += '<button class="btn btn-edit" onclick="editJob(\'' + j.id + '\')">EDIT</button>';
-                    }
-                    btns += '<button class="btn btn-del" onclick="control(\'' + j.id + '\',\'delete\')">DEL</button>';
-                    if (isFailed) {
-                        btns += '<button class="btn btn-retry" onclick="control(\'' + j.id + '\',\'retry\')">RETRY</button>';
-                        if (hasBoth) {
-                            btns += '<button class="btn btn-retry-fail" onclick="control(\'' + j.id + '\',\'retry_failed\')">RETRY FAILED</button>';
-                        }
-                    }
-                }
-
-                return `
-                <div class="job-card ${isEditing ? 'being-edited' : ''}">
-                    <div class="job-header">
-                        <div>
-                            <b style="color:var(--blue)">[${escapeHtml(j.time)}]</b>
-                            ${badge(j.status)}
-                            <span style="color:#8b949e;font-size:0.8rem;margin-left:6px">
-                                ${j.url_total} URL${j.url_total !== 1 ? 's' : ''} &mdash; ${escapeHtml(j.folder)}
-                            </span>
-                        </div>
-                        <div class="btn-row">${btns}</div>
-                    </div>
-                    ${editHint}
-                    ${isActive || isFailed
-                        ? '<div class="job-footer">' + progressSection + failedSection + '</div>'
-                        : ''}
-                </div>`;
-            }).join('');
+    function scheduleNext(ms) {
+        clearTimeout(pollTimer);
+        pollTimer = setTimeout(poll, ms);
     }
+
+    function reschedule(jobs) {
+        const busy = jobs && jobs.some(j => j.status === 'running' || j.status === 'paused' || j.status === 'dl_paused');
+        scheduleNext(document.hidden ? 15000 : busy ? 1500 : 5000);
+    }
+
+    function poll() {
+        clearTimeout(pollTimer);
+        loadJobs().then(jobs => {
+            if (jobs === null && pollBusy) scheduleNext(600); // another refresh owns the request
+            else reschedule(jobs);
+        });
+    }
+
+    function refreshJobs() { poll(); }
+
+    document.addEventListener('visibilitychange', () => {
+        if (document.hidden) scheduleNext(15000);
+        else poll();
+    });
 
     // ── Settings ────────────────────────────────────────
 
+    const focusableSelector = 'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])';
+
     function openSettings() {
-        document.getElementById('settings-modal').classList.add('show');
+        lastFocus = document.activeElement;
+        settingsModal.classList.add('show');
         loadSettings();
+        document.getElementById('set_conns').focus();
+        document.getElementById('set_conns').select();
     }
 
     function closeSettings() {
-        document.getElementById('settings-modal').classList.remove('show');
+        settingsModal.classList.remove('show');
+        if (lastFocus && lastFocus.focus) lastFocus.focus();
     }
+
+    const settingInputs = [...settingsModal.querySelectorAll('[data-setting]')];
 
     async function loadSettings() {
         try {
-            const res  = await safeFetch('/settings');
-            const data = await res.json();
-            const s    = data.settings || {};
-            document.getElementById('set_conns').value = s.connections_per_server || 16;
-            document.getElementById('set_mss').value    = s.min_split_size || '8M';
+            const res = await safeFetch('/settings');
+            const s = (await res.json()).settings || {};
+            for (const el of settingInputs) {
+                const key = el.dataset.setting;
+                if (!(key in s)) continue;
+                if (el.type === 'checkbox') el.checked = Boolean(s[key]);
+                else el.value = s[key];
+            }
         } catch {}
     }
 
     async function saveSettings() {
-        const conns = parseInt(document.getElementById('set_conns').value, 10);
-        const mss   = document.getElementById('set_mss').value.trim();
-        if (!conns || conns < 1 || conns > 64) {
-            showToast("Connections must be between 1 and 64.", "warning");
-            return;
+        const payload = {};
+        for (const el of settingInputs) {
+            const key = el.dataset.setting;
+            if (el.type === 'checkbox') payload[key] = el.checked;
+            else if (el.dataset.type === 'int') payload[key] = parseInt(el.value, 10);
+            else payload[key] = el.value.trim();
         }
-        if (!/^\d+[mMkKgG]$/.test(mss)) {
-            showToast("Segment size must look like 4M, 8M, 16M\u2026", "warning");
-            return;
+        const bad = msg => { showToast(msg, 'warning'); };
+        if (!Number.isInteger(payload.connections_per_server) || payload.connections_per_server < 1 || payload.connections_per_server > 64)
+            return bad('Connections must be between 1 and 64.');
+        if (!/^\d+[MKG]$/i.test(payload.min_split_size))
+            return bad('Segment size must look like 4M, 8M, 16M…');
+        if (!['none', 'prealloc', 'falloc', 'trunc'].includes(payload.file_allocation))
+            return bad('Choose a valid file allocation method.');
+        if (!/^(0|\d+[KMG])$/i.test(payload.max_download_limit))
+            return bad('Speed limit must be 0 or a value like 10M.');
+        for (const [key, lo, hi] of [['max_tries', 0, 64], ['retry_wait', 0, 600],
+                                     ['connect_timeout', 1, 600], ['timeout', 1, 600]]) {
+            const n = payload[key];
+            if (!Number.isInteger(n) || n < lo || n > hi)
+                return bad(key.replace(/_/g, ' ') + ' must be between ' + lo + ' and ' + hi + '.');
         }
-        await safeFetch('/settings', {
-            method: 'POST',
-            headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({connections_per_server: conns, min_split_size: mss.toUpperCase()})
-        });
-        showToast('Settings saved \u2014 applies to new downloads.', 'success');
-        closeSettings();
+        try {
+            await safeFetch('/settings', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify(payload)
+            });
+            showToast('Settings saved — applies to new downloads.', 'success');
+            closeSettings();
+        } catch {}
     }
 
-    document.getElementById('settings-modal').addEventListener('click', e => {
-        if (e.target === e.currentTarget) closeSettings();
+    settingsModal.addEventListener('click', e => {
+        if (e.target === settingsModal) closeSettings();
+    });
+    settingsModal.addEventListener('keydown', e => {
+        if (e.key !== 'Tab') return;
+        const items = [...settingsModal.querySelectorAll(focusableSelector)].filter(el =>
+            !el.hidden && el.offsetParent !== null && !el.closest('details:not([open])'));
+        if (!items.length) return;
+        const first = items[0], last = items[items.length - 1];
+        if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+        else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
     });
     document.addEventListener('keydown', e => {
-        if (e.key === 'Escape') closeSettings();
+        if (e.key === 'Escape' && settingsModal.classList.contains('show')) closeSettings();
     });
 
-    adaptiveRefresh();
+    updateGutter();
+    poll();
 </script>
 </body>
 </html>
+
 """
 
 
@@ -1418,17 +2090,19 @@ def autocomplete():
     dirname = os.path.dirname(term) or (os.sep if term.startswith(os.sep) else ".")
     prefix = os.path.basename(term)
     paths = []
-    try:
-        if os.path.exists(dirname):
-            for f in sorted(os.listdir(dirname)):
-                if f.startswith(prefix):
-                    full = os.path.join(dirname, f)
-                    if os.path.isdir(full):
-                        paths.append(full + os.sep)
-    except PermissionError:
-        pass
-    except OSError as e:
-        log.warning("autocomplete error: %s", e)
+    if os.path.isdir(dirname):
+        try:
+            # scandir avoids a stat() per entry; filter first so we only sort
+            # the handful of matches instead of the whole (media) directory.
+            with os.scandir(dirname) as entries:
+                for entry in entries:
+                    if entry.name.startswith(prefix) and entry.is_dir():
+                        paths.append(entry.path + os.sep)
+        except PermissionError:
+            pass
+        except OSError as e:
+            log.warning("autocomplete error: %s", e)
+    paths.sort()
     return jsonify({"paths": paths[:12], "exists": exists})
 
 
@@ -1603,7 +2277,7 @@ def list_jobs():
 
 @app.route("/control/<action>/<jid>", methods=["POST"])
 def control_job(action, jid):
-    known = {"delete", "pause", "dl_pause", "dl_resume", "start_now", "retry", "retry_failed"}
+    known = {"delete", "pause", "dl_pause", "dl_resume", "start_now", "retry", "retry_failed", "retry_url"}
     if action not in known:
         return jsonify({"status": "error", "message": f"Unknown action: {action}"}), 400
 
@@ -1674,6 +2348,15 @@ def control_job(action, jid):
                 job_status[jid]["dl_paused"] = False
                 job_status[jid]["failed"] = []
                 job_status[jid]["_retry_only"] = failed
+
+    elif action == "retry_url":
+        url = (request.json or {}).get("url", "")
+        with _status_lock:
+            st = job_status.get(jid)
+            if st and url and url in st.get("failed", []):
+                st["_retry_only"] = [url]
+                st["status"] = "queued"
+                st["dl_paused"] = False
 
     _save_tasks()
     return jsonify({"status": "ok"})

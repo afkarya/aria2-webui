@@ -10,14 +10,18 @@ A self-contained web interface for scheduling and managing downloads with [aria2
 
 - Schedule downloads at specific times via cron
 - Start downloads immediately
+- Numbered, spaced link editor so each URL is easy to scan and edit
 - Real-time progress tracking (speed, percentage, file size)
 - Pause/resume individual downloads and schedules
 - Edit scheduled tasks (URLs, destination, time)
-- Retry failed downloads individually or in bulk
+- Retry failed downloads individually, per link, or in bulk
+- Progress ETA and countdown to scheduled start
 - Path autocomplete with tab completion
 - Auto path creation
 - Path history across sessions
-- Dark theme with responsive layout
+- Configurable download settings (connections, allocation, speed cap, retries, timeouts, headers)
+- Responsive light/dark theme that follows the system preference
+- Keyboard-friendly: labeled fields, visible focus, focus-trapped settings, `Ctrl+Enter` to start
 - Tab title status indicator
 
 ## Requirements
@@ -74,6 +78,16 @@ All settings use environment variables with defaults:
 | `DOWNLOAD_STALL_SECONDS` | `300` | Seconds before aborting stalled download |
 | `CONNECTIONS_PER_SERVER` | `16` | Parallel connections/server (segmented downloads bypass per-connection speed limits) |
 | `MIN_SPLIT_SIZE` | `8M` | Minimum segment size per split connection |
+| `FILE_ALLOCATION` | `none` | `none`, `prealloc`, `falloc`, or `trunc` |
+| `MAX_DOWNLOAD_LIMIT` | `0` | Speed cap per download (`0` = unlimited, e.g. `10M`) |
+| `MAX_TRIES` | `5` | aria2 retry attempts (`0` = unlimited) |
+| `RETRY_WAIT` | `0` | Seconds between retries |
+| `CHECK_CERTIFICATE` | `false` | Verify TLS certificates |
+| `CONNECT_TIMEOUT` | `60` | Connection timeout in seconds |
+| `TIMEOUT` | `60` | Download timeout in seconds |
+| `USER_AGENT` | *(empty)* | HTTP User-Agent for downloads |
+| `REFERER` | *(empty)* | HTTP Referer for downloads |
+| `REMOTE_TIME` | `false` | Preserve remote file timestamps |
 | `HOST` | `127.0.0.1` | Web UI listen address |
 | `PORT` | `5000` | Web UI listen port |
 
@@ -109,7 +123,7 @@ python3 aria2-webui.py --help
 |--------|-------|-------------|
 | GET | `/` | Web UI |
 | GET | `/health` | Health check (aria2 status, task count) |
-| GET/POST | `/settings` | Read/update download settings (connections/server, segment size), persisted to task DB |
+| GET/POST | `/settings` | Read/update download settings, persisted to task DB |
 | GET | `/jobs` | List all jobs with progress |
 | GET | `/autocomplete?term=PATH` | Path tab-completion |
 | POST | `/create_path` | Create a directory |
