@@ -800,19 +800,31 @@ HTML_TEMPLATE = r"""
         textarea { resize:vertical; min-height:124px; line-height:1.65; }
         input[type="time"] { font-family:var(--font-mono); }
 
-        /* Numbered link editor: gutter + roomy one-line-per-URL rows */
+        /* Numbered link editor: a real line-number rail beside one-line-per-URL rows */
         .editor {
             display:flex; border:1px solid var(--border);
             border-radius:var(--radius-sm); background:var(--bg); overflow:hidden;
         }
         .editor:focus-within { border-color:var(--accent); }
         .editor-gutter {
-            flex:0 0 26px; padding:11px 5px; background:var(--surface-2);
-            border-right:1px solid var(--border); color:var(--faint);
+            flex:0 0 26px; padding:11px 0; background:var(--surface-2);
+            border-right:1px solid var(--border); color:var(--muted);
             font-family:var(--font-mono); font-size:var(--sm);
-            line-height:24px; text-align:right; overflow:hidden; user-select:none;
+            font-variant-numeric:tabular-nums; line-height:24px;
+            overflow:hidden; user-select:none;
         }
-        .editor-gutter span { display:block; }
+        .editor-gutter .gutter-row {
+            position:relative; display:flex; align-items:center; justify-content:flex-start;
+            height:24px; padding:0 8px 0 8px; border-left:2px solid transparent;
+        }
+        .editor-gutter .mark {
+            position:absolute; left:2px; top:50%; transform:translateY(-50%);
+            width:4px; height:4px; border-radius:50%;
+        }
+        .editor-gutter .invalid .mark { background:var(--danger); }
+        .editor-gutter .invalid .num { color:var(--danger); }
+        .editor-gutter .active { background:var(--accent-tint); border-left-color:var(--accent); }
+        .editor-gutter .active .num { color:var(--accent); font-weight:700; }
         #urls {
             flex:1; min-width:0; border:0; border-radius:0; padding:11px 12px;
             background:var(--bg); line-height:24px;
@@ -886,12 +898,40 @@ HTML_TEMPLATE = r"""
         }
 
         .schedule-row {
-            display:grid; grid-template-columns:minmax(150px,190px) 1fr;
+            display:grid; grid-template-columns:minmax(230px,290px) 1fr;
             gap:14px; align-items:end; margin-top:4px;
         }
         .schedule-row .field { margin-bottom:0; }
+        .schedule-row .actions { justify-content:flex-start; }
+        .schedule-row .actions .btn { flex:1; }
+        .schedule-row #btns-edit .btn { flex:0 0 auto; min-width:150px; }
         .actions { display:flex; gap:10px; justify-content:flex-end; }
         .actions .btn { flex:1; min-height:44px; }
+
+        /* Start at + Schedule share one bright border, matching the Start now button */
+        .time-input-group {
+            display:flex; align-items:stretch; position:relative; height:44px;
+            border:1px solid var(--accent); border-radius:var(--radius-sm); background:var(--bg);
+        }
+        .time-input-group.editing { border-color:var(--violet); }
+        .time-input-group input[type="time"] {
+            flex:1; min-width:0; min-height:0; height:100%;
+            border:0; background:transparent;
+            padding:0 12px; font-family:var(--font-mono); font-size:var(--sm); line-height:1;
+        }
+        .time-input-group input[type="time"]:focus,
+        .time-input-group input[type="time"]:focus-visible,
+        .time-action:focus-visible { outline:none; }
+        .time-action {
+            flex:0 0 auto; height:100%; display:inline-flex; align-items:center; justify-content:center; gap:6px;
+            border:0; border-left:1px solid var(--border);
+            background:var(--accent-tint); color:var(--accent);
+            padding:0 14px; font-size:var(--sm); font-weight:600; white-space:nowrap;
+        }
+        .time-action .ico { font-size:1em; line-height:1; }
+        .time-action:hover { background:var(--accent); color:var(--accent-text); }
+        .time-action--save { background:var(--violet-tint); color:var(--violet); }
+        .time-action--save:hover { background:var(--violet); color:#fff; }
 
         .btn {
             display:inline-flex; align-items:center; justify-content:center; gap:6px;
@@ -902,8 +942,6 @@ HTML_TEMPLATE = r"""
         .btn .ico { font-size:1em; line-height:1; }
         .btn--primary { background:var(--accent); color:var(--accent-text); }
         .btn--primary:hover { background:var(--accent-hover); }
-        .btn--accent { background:var(--accent-tint); color:var(--accent); border-color:var(--accent); }
-        .btn--accent:hover { background:var(--accent); color:var(--accent-text); }
         .btn--start { background:var(--success-btn-tint); color:var(--success); border-color:var(--success); }
         .btn--start:hover { background:var(--success-btn); color:#fff; border-color:var(--success-btn); }
         .btn--edit { background:var(--violet-tint); color:var(--violet); border-color:var(--violet); }
@@ -1087,6 +1125,10 @@ HTML_TEMPLATE = r"""
             #settings-btn { top:15px; right:16px; }
             .card-head { padding-right:40px; }
             .schedule-row { grid-template-columns:1fr; gap:12px; }
+            .time-input-group { height:42px; }
+            .time-input-group input[type="time"], .time-action { height:42px; }
+            .schedule-row .actions .btn { flex:1; }
+            .schedule-row #btns-edit .btn { flex:1; }
             .actions .btn { min-height:42px; }
             .job-heading { width:100%; }
             .job-actions { width:100%; flex-wrap:wrap; margin-left:0; }
@@ -1138,15 +1180,17 @@ HTML_TEMPLATE = r"""
     <div class="schedule-row">
         <div class="field">
             <label for="start_time">Start at</label>
-            <input type="time" id="start_time">
+            <div class="time-input-group" id="time-group">
+                <input type="time" id="start_time">
+                <button type="button" class="time-action" id="btn-schedule" onclick="submitTask('schedule')"><span class="ico">◷</span> Schedule</button>
+                <button type="button" class="time-action time-action--save" id="btn-save" hidden onclick="saveEdit()"><span class="ico">✓</span> Save changes</button>
+            </div>
         </div>
         <div class="actions" id="btns-normal">
-            <button type="button" class="btn btn--accent" onclick="submitTask('schedule')"><span class="ico">◷</span> Schedule</button>
             <button type="button" class="btn btn--start" onclick="submitTask('now')"><span class="ico">↓</span> Start now</button>
         </div>
         <div class="actions" id="btns-edit" hidden>
             <button type="button" class="btn btn--ghost" onclick="cancelEdit()">Cancel</button>
-            <button type="button" class="btn btn--primary" onclick="saveEdit()"><span class="ico">✓</span> Save changes</button>
         </div>
     </div>
 </section>
@@ -1245,6 +1289,9 @@ HTML_TEMPLATE = r"""
     const formTitle     = document.getElementById('form-title');
     const btnsNormal    = document.getElementById('btns-normal');
     const btnsEdit      = document.getElementById('btns-edit');
+    const timeGroup     = document.getElementById('time-group');
+    const btnSchedule   = document.getElementById('btn-schedule');
+    const btnSaveLinked = document.getElementById('btn-save');
     const urlsTextarea  = document.getElementById('urls');
     const urlGutter     = document.getElementById('url-gutter');
     const urlCountEl    = document.getElementById('url-count');
@@ -1455,17 +1502,40 @@ HTML_TEMPLATE = r"""
         urlCountEl.innerHTML = html;
     }
 
+    let gutterLineCount = 0;
+
+    function updateActiveLine() {
+        const value = urlsTextarea.value;
+        const line = value.slice(0, urlsTextarea.selectionStart).split('\n').length;
+        const rows = urlGutter.children;
+        for (let i = 0; i < rows.length; i++)
+            rows[i].classList.toggle('active', value !== '' && i + 1 === line);
+    }
+
     function updateGutter() {
-        const count = Math.max(1, urlsTextarea.value.split('\n').length);
-        let html = '';
-        for (let i = 1; i <= count; i++) html += '<span>' + i + '</span>';
-        urlGutter.innerHTML = html;
-        urlGutter.style.flexBasis = Math.max(26, String(count).length * 9 + 10) + 'px';
+        const lines = urlsTextarea.value.split('\n');
+        const count = Math.max(1, lines.length);
+        if (count !== gutterLineCount) {
+            let html = '';
+            for (let i = 1; i <= count; i++)
+                html += '<span class="gutter-row"><span class="mark"></span><span class="num">' + i + '</span></span>';
+            urlGutter.innerHTML = html;
+            urlGutter.style.flexBasis = Math.max(26, String(count).length * 8 + 18) + 'px';
+            gutterLineCount = count;
+        }
+        const rows = urlGutter.children;
+        for (let i = 0; i < rows.length; i++) {
+            const raw = (lines[i] || '').trim();
+            rows[i].classList.toggle('invalid', raw !== '' && !isValidUrl(raw));
+        }
+        updateActiveLine();
         urlGutter.scrollTop = urlsTextarea.scrollTop;
     }
 
     urlsTextarea.addEventListener('input', () => { updateGutter(); updateUrlCount(); });
     urlsTextarea.addEventListener('scroll', () => { urlGutter.scrollTop = urlsTextarea.scrollTop; });
+    ['click', 'keyup', 'select', 'focus'].forEach(evt =>
+        urlsTextarea.addEventListener(evt, updateActiveLine));
     urlsTextarea.addEventListener('paste', () => setTimeout(() => {
         // Browsers scroll long lines to reveal the caret after a paste —
         // snap back so the start of the links stays visible next to the
@@ -1493,6 +1563,9 @@ HTML_TEMPLATE = r"""
         formTitle.textContent = 'Editing task';
         btnsNormal.hidden = true;
         btnsEdit.hidden = false;
+        btnSchedule.hidden = true;
+        btnSaveLinked.hidden = false;
+        timeGroup.classList.add('editing');
         window.scrollTo({top: 0, behavior: 'smooth'});
         checkPath(job.folder);
         updateGutter();
@@ -1507,6 +1580,9 @@ HTML_TEMPLATE = r"""
         formTitle.textContent = 'New task';
         btnsNormal.hidden = false;
         btnsEdit.hidden = true;
+        btnSchedule.hidden = false;
+        btnSaveLinked.hidden = true;
+        timeGroup.classList.remove('editing');
         refreshJobs();
     }
 
@@ -1516,6 +1592,7 @@ HTML_TEMPLATE = r"""
         document.getElementById('start_time').value = '';
         suggBox.innerHTML = '';
         pathStatus.classList.remove('show');
+        gutterLineCount = 0;
         urlGutter.innerHTML = '';
         urlCountEl.innerHTML = '';
     }
