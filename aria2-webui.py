@@ -944,6 +944,9 @@ HTML_TEMPLATE = r"""
         }
         .job-actions { display:flex; flex:0 0 auto; gap:6px; flex-wrap:nowrap; margin-left:auto; }
         .job-actions .btn { padding:5px 9px; min-height:32px; font-size:var(--xs); }
+        /* Waiting / failed jobs put their actions on a left-aligned row below the heading. */
+        .job-card.align-actions-left .job-top { flex-direction:column; align-items:flex-start; }
+        .job-card.align-actions-left .job-actions { margin-left:0; }
         .job-sub { margin-top:7px; font-size:var(--xs); color:var(--muted); }
         .job-sub .dot { color:var(--faint); margin:0 5px; }
         .job-sub .eta { color:var(--accent); font-weight:600; }
@@ -1631,6 +1634,13 @@ HTML_TEMPLATE = r"""
                 j.sched_paused, j.failed_urls.join('|'), j.id === editingJobId].join('\u0001');
     }
 
+    function jobCardClass(j) {
+        const left = j.status === 'waiting' || j.status === 'queued' || j.status === 'failed';
+        return 'job-card status-' + j.status +
+               (left ? ' align-actions-left' : '') +
+               (j.id === editingJobId ? ' being-edited' : '');
+    }
+
     function jobButtons(j) {
         const isRunning = j.status === 'running';
         const isPaused  = j.status === 'paused' || j.status === 'dl_paused';
@@ -1639,25 +1649,28 @@ HTML_TEMPLATE = r"""
         const isActive  = isRunning || isPaused;
         if (j.id === editingJobId) return '';
 
+        const editBtn = '<button type="button" class="btn btn--edit" aria-label="Edit task ' + escapeHtml(j.id) + '" ' +
+                        'onclick="editJob(\'' + escapeHtml(j.id) + '\')"><span class="ico" aria-hidden="true">✎</span>Edit</button>';
+        const deleteBtn = '<button type="button" class="btn btn--danger" data-armed="0" aria-label="Delete task ' + escapeHtml(j.id) + '" ' +
+                          'onclick="armDelete(\'' + escapeHtml(j.id) + '\',this)"><span class="ico" aria-hidden="true">✕</span>Delete</button>';
+
         let btns = '';
+        if (isFailed) {
+            if (j.failed_urls.length && j.done_count > 0) {
+                btns += actionBtn(j.id, 'retry_failed', 'Retry failed', 'btn--retry-outline');
+            }
+            btns += actionBtn(j.id, 'retry', 'Retry', 'btn--retry');
+            btns += editBtn + deleteBtn;
+            return btns;
+        }
         if (isWaiting) {
             btns += actionBtn(j.id, 'start_now', 'Start now', 'btn--start');
             btns += actionBtn(j.id, 'pause', j.sched_paused ? 'Resume schedule' : 'Pause schedule', 'btn--warn');
         }
         if (isRunning) btns += actionBtn(j.id, 'dl_pause', 'Pause', 'btn--warn');
         if (isPaused)  btns += actionBtn(j.id, 'dl_resume', 'Resume', 'btn--start');
-        if (!isActive) {
-            btns += '<button type="button" class="btn btn--edit" aria-label="Edit task ' + escapeHtml(j.id) + '" ' +
-                    'onclick="editJob(\'' + escapeHtml(j.id) + '\')"><span class="ico" aria-hidden="true">✎</span>Edit</button>';
-        }
-        btns += '<button type="button" class="btn btn--danger" data-armed="0" aria-label="Delete task ' + escapeHtml(j.id) + '" ' +
-                'onclick="armDelete(\'' + escapeHtml(j.id) + '\',this)"><span class="ico" aria-hidden="true">✕</span>Delete</button>';
-        if (isFailed) {
-            btns += actionBtn(j.id, 'retry', 'Retry', 'btn--retry');
-            if (j.failed_urls.length && j.done_count > 0) {
-                btns += actionBtn(j.id, 'retry_failed', 'Retry failed', 'btn--retry-outline');
-            }
-        }
+        if (!isActive) btns += editBtn;
+        btns += deleteBtn;
         return btns;
     }
 
@@ -1688,7 +1701,7 @@ HTML_TEMPLATE = r"""
         const pct = parseFloat(j.progress) || 0;
 
         return `
-        <article class="job-card status-${escapeHtml(j.status)} ${isEditing ? 'being-edited' : ''}" data-job-id="${escapeHtml(j.id)}">
+        <article class="${jobCardClass(j)}" data-job-id="${escapeHtml(j.id)}">
             <div class="job-top">
                 <div class="job-heading">
                     <span class="job-time mono" data-role="time">[${escapeHtml(j.time)}]</span>
@@ -1780,7 +1793,7 @@ HTML_TEMPLATE = r"""
         if (sig !== view.sig) {
             const isEditing = j.id === editingJobId;
             const status = isEditing ? 'editing' : j.status;
-            el.className = 'job-card status-' + j.status + (isEditing ? ' being-edited' : '');
+            el.className = jobCardClass(j);
             setText(view, 'time', '[' + j.time + ']');
             const b = q('badge');
             if (b) { b.dataset.status = status; b.textContent = status.replace('_', ' '); }
