@@ -12,6 +12,7 @@ import logging
 import argparse
 import tempfile
 import re
+from urllib.parse import unquote, urlsplit
 
 import requests
 from flask import Flask, render_template_string, request, jsonify
@@ -287,17 +288,31 @@ def _is_valid_url(url):
 
 
 def _url_to_filename(url):
-    """Extract a plausible filename from a URL."""
-    name = url.split("?")[0].split("/")[-1]
-    return name if name else None
+    """Extract a plausible filename from a URL (query/fragment stripped)."""
+    name = unquote(urlsplit(url).path).rsplit("/", 1)[-1].strip()
+    return name or None
 
 
 def _check_already_downloaded(url, folder):
+    """True when a complete, non-empty file with no .aria2 control file exists."""
     filename = _url_to_filename(url)
     if not filename:
         return False
-    filepath = os.path.join(folder, filename)
-    return os.path.exists(filepath) and not os.path.exists(filepath + ".aria2")
+    try:
+        entries = [e for e in os.scandir(folder) if e.is_file()]
+    except OSError:
+        return False
+    wanted = filename.casefold()
+    for entry in entries:
+        if entry.name.casefold() != wanted:
+            continue
+        try:
+            if entry.stat().st_size <= 0 or os.path.exists(entry.path + ".aria2"):
+                continue
+        except OSError:
+            continue
+        return True
+    return False
 
 
 # ── Formatting ───────────────────────────────────────────────────────
@@ -342,6 +357,8 @@ def _save_tasks():
                 "paused": job.next_run_time is None,
                 "created_at": job.args[2],
                 "failed_urls": info.get("failed", []),
+                "failed_errors": info.get("errors", {}),
+                "done": info.get("done", []),
                 "dl_paused": info.get("dl_paused", False),
             })
         try:
@@ -410,8 +427,9 @@ def _load_tasks():
                 "speed": "0 B/s",
                 "progress": 0,
                 "size": "",
-                "done": [],
+                "done": t.get("done", []),
                 "failed": t.get("failed_urls", []),
+                "errors": t.get("failed_errors", {}),
             }
     log.info("Loaded %d task(s) from %s.", len(tasks), _DB_FILE)
 
@@ -421,15 +439,21 @@ def _load_tasks():
 # ══════════════════════════════════════════════════════════════════════
 
 def _wait_for_gid(gid, job_id, url):
-    """Poll aria2.tellStatus until download finishes, errors, or is removed.
-    Returns True on success, False otherwise.  Detects stalls."""
+    """Poll aria2.tellStatus until the download finishes or fails.
+
+    Returns (outcome, error) where outcome is:
+      "done"   – completed (or the file was already present and intact)
+      "failed" – genuine failure; error holds aria2's message
+      "gone"   – job was deleted or the app is shutting down
+    Detects stalls.
+    """
     last_completed = -1
     stall_start = None
 
     while not _shutdown_flag.is_set():
         with _status_lock:
             if job_id not in job_status:
-                return False
+                return "gone", ""
 
         result = _rpc("aria2.tellStatus", [gid])
         if not result:
@@ -457,7 +481,7 @@ def _wait_for_gid(gid, job_id, url):
                     log.warning("[%s] Download stalled for %s s — aborting: %s",
                                 job_id, _DOWNLOAD_STALL_SECONDS, url)
                     _rpc("aria2.remove", [gid])
-                    return False
+                    return "failed", "Download stalled"
             else:
                 stall_start = None
                 last_completed = completed
@@ -466,7 +490,7 @@ def _wait_for_gid(gid, job_id, url):
         if status == "paused":
             with _status_lock:
                 if job_id not in job_status:
-                    return False
+                    return "gone", ""
                 job_status[job_id].update({
                     "status": "paused",
                     "dl_paused": True,
@@ -481,7 +505,7 @@ def _wait_for_gid(gid, job_id, url):
 
         with _status_lock:
             if job_id not in job_status:
-                return False
+                return "gone", ""
             # Transition out of dl_paused state when aria2 is active again
             if job_status[job_id].get("dl_paused") and status == "active":
                 job_status[job_id]["dl_paused"] = False
@@ -495,15 +519,27 @@ def _wait_for_gid(gid, job_id, url):
             })
 
         if status == "complete":
-            return True
+            return "done", ""
+
         if status == "error":
-            log.error("[FAIL] %s: %s", url, result.get("errorMessage", ""))
-            return False
+            err_code = str(result.get("errorCode") or "")
+            err_msg  = result.get("errorMessage", "")
+            # aria2 code 13: the file already exists with no .aria2 control
+            # file.  That means the file is already downloaded and intact —
+            # count it as done instead of failing the link.
+            if err_code == "13" or ("control file" in err_msg.lower()
+                                    and "does not exist" in err_msg.lower()):
+                log.info("[ALREADY] File already present, counting as done: %s", url)
+                return "done", ""
+            log.error("[FAIL] %s: %s", url, err_msg)
+            return "failed", err_msg
+
         if status == "removed":
-            return False
+            return "failed", "Download was removed in aria2"
+
         time.sleep(0.5)
 
-    return False  # shutdown requested
+    return "gone", ""
 
 
 def _run_job(job_id, urls, folder):
@@ -527,6 +563,7 @@ def _run_job(job_id, urls, folder):
                 "size": "",
                 "done": job_status[job_id].get("done", []),
                 "failed": other_failed,
+                "errors": job_status[job_id].get("errors", {}),
             })
 
     for url in urls:
@@ -553,6 +590,7 @@ def _run_job(job_id, urls, folder):
             with _status_lock:
                 if job_id in job_status:
                     job_status[job_id]["failed"].append(url)
+                    job_status[job_id].setdefault("errors", {})[url] = "Invalid URL"
             continue
 
         gid = _add_uri(url, folder)
@@ -560,21 +598,25 @@ def _run_job(job_id, urls, folder):
             with _status_lock:
                 if job_id in job_status:
                     job_status[job_id]["failed"].append(url)
+                    job_status[job_id].setdefault("errors", {})[url] = "Could not add download to aria2"
             continue
 
         with _active_gids_lock:
             active_gids[job_id] = gid
 
-        success = _wait_for_gid(gid, job_id, url)
+        outcome, error = _wait_for_gid(gid, job_id, url)
         with _status_lock:
             if job_id not in job_status:
                 with _active_gids_lock:
                     active_gids.pop(job_id, None)
                 break
-            if success:
+            if outcome == "done":
                 job_status[job_id]["done"].append(url)
-            else:
+                job_status[job_id].get("errors", {}).pop(url, None)
+            elif outcome == "failed":
                 job_status[job_id]["failed"].append(url)
+                if error:
+                    job_status[job_id].setdefault("errors", {})[url] = error
 
         with _active_gids_lock:
             active_gids.pop(job_id, None)
@@ -1033,9 +1075,12 @@ HTML_TEMPLATE = r"""
         .failed-box summary::-webkit-details-marker { display:none; }
         .failed-box summary::before { content:"▸ "; }
         .failed-box[open] summary::before { content:"▾ "; }
-        .failed-list { list-style:none; margin:9px 0 0; padding:0; display:flex; flex-direction:column; gap:6px; }
+        .failed-progress { margin-top:7px; font-size:var(--xs); color:var(--muted); }
+        .failed-list { list-style:none; margin:9px 0 0; padding:0; display:flex; flex-direction:column; gap:8px; }
         .failed-list li { display:flex; align-items:center; gap:8px; font-size:var(--xs); }
-        .failed-list .url { flex:1; min-width:0; word-break:break-all; color:var(--muted); }
+        .failed-list .entry { flex:1; min-width:0; display:flex; flex-direction:column; gap:2px; }
+        .failed-list .url { word-break:break-all; color:var(--muted); }
+        .failed-list .err { color:var(--danger); word-break:break-word; }
         .mini-btn {
             flex-shrink:0; min-height:28px; padding:3px 9px; border-radius:var(--radius-sm);
             background:var(--cyan-tint); border:1px solid var(--cyan);
@@ -1707,8 +1752,10 @@ HTML_TEMPLATE = r"""
     }
 
     function jobSignature(j) {
+        const errors = j.failed_urls.map(u => (j.failed_errors || {})[u] || '').join('|');
         return [j.time, j.folder, j.status, j.url_total, j.done_count,
-                j.sched_paused, j.failed_urls.join('|'), j.id === editingJobId].join('\u0001');
+                j.sched_paused, j.failed_urls.join('|'), errors,
+                j.id === editingJobId].join('\u0001');
     }
 
     function jobCardClass(j) {
@@ -1755,14 +1802,18 @@ HTML_TEMPLATE = r"""
         if (j.status !== 'failed' || !j.failed_urls.length) {
             return '<div class="failed-box" data-role="failed" hidden></div>';
         }
+        const errors = j.failed_errors || {};
         return `<details class="failed-box" data-role="failed">
             <summary>${j.failed_urls.length} failed link${j.failed_urls.length !== 1 ? 's' : ''} — click to expand</summary>
+            <div class="failed-progress">${j.done_count} / ${j.url_total} files done</div>
             <ul class="failed-list">
-                ${j.failed_urls.map(u =>
-                    '<li><span class="url">' + escapeHtml(u) + '</span>' +
-                    '<button type="button" class="mini-btn" aria-label="Retry link ' + escapeHtml(u) + '" ' +
-                    'onclick="retryUrl(\'' + escapeHtml(j.id) + '\',this.dataset.u)" data-u="' + escapeHtml(u) + '">Retry</button></li>'
-                ).join('')}
+                ${j.failed_urls.map(u => {
+                    const err = errors[u];
+                    return '<li><span class="entry"><span class="url">' + escapeHtml(u) + '</span>' +
+                        (err ? '<span class="err">' + escapeHtml(err) + '</span>' : '') + '</span>' +
+                        '<button type="button" class="mini-btn" aria-label="Retry link ' + escapeHtml(u) + '" ' +
+                        'onclick="retryUrl(\'' + escapeHtml(j.id) + '\',this.dataset.u)" data-u="' + escapeHtml(u) + '">Retry</button></li>';
+                }).join('')}
             </ul>
         </details>`;
     }
@@ -2266,7 +2317,7 @@ def schedule():
             "status": "queued" if start_now else "waiting",
             "current_url": "", "current_file": "",
             "speed": "0 B/s", "progress": 0, "size": "",
-            "done": [], "failed": [],
+            "done": [], "failed": [], "errors": {},
         }
 
     _save_tasks()
@@ -2326,6 +2377,7 @@ def edit_job(jid):
             "failed": old_status.get("failed", [])
             if old_status.get("status") == "failed"
             else [],
+            "errors": old_status.get("errors", {}),
         }
 
     _save_tasks()
@@ -2357,6 +2409,7 @@ def list_jobs():
             "progress": s.get("progress", 0),
             "size": s.get("size", ""),
             "failed_urls": s.get("failed", []),
+            "failed_errors": s.get("errors", {}),
             "status": s.get("status", "waiting"),
             "created_at": j.args[2],
             "sched_paused": j.next_run_time is None,
@@ -2426,9 +2479,15 @@ def control_job(action, jid):
 
     elif action == "retry":
         with _status_lock:
-            if jid in job_status and job_status[jid].get("failed"):
-                job_status[jid]["status"] = "queued"
-                job_status[jid]["dl_paused"] = False
+            st = job_status.get(jid)
+            if st and st.get("failed"):
+                # Clear the stale failures, otherwise the job is marked failed
+                # again at finalization even when every link now succeeds.
+                st["failed"] = []
+                st.pop("_retry_only", None)
+                st.get("errors", {}).clear()
+                st["status"] = "queued"
+                st["dl_paused"] = False
 
     elif action == "retry_failed":
         with _status_lock:
@@ -2438,6 +2497,8 @@ def control_job(action, jid):
                 job_status[jid]["dl_paused"] = False
                 job_status[jid]["failed"] = []
                 job_status[jid]["_retry_only"] = failed
+                for u in failed:
+                    job_status[jid].get("errors", {}).pop(u, None)
 
     elif action == "retry_url":
         url = (request.json or {}).get("url", "")
@@ -2447,6 +2508,7 @@ def control_job(action, jid):
                 st["_retry_only"] = [url]
                 st["status"] = "queued"
                 st["dl_paused"] = False
+                st.get("errors", {}).pop(url, None)
 
     _save_tasks()
     return jsonify({"status": "ok"})
