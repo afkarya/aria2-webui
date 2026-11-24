@@ -62,8 +62,11 @@ The script will ask you a few questions:
 It supports Debian/Ubuntu, Arch, Fedora and OpenWrt, installs into
 `/opt/aria2-webui`, and sets up a `systemd` service (a procd init script on
 OpenWrt) that auto-starts at boot. Re-run it any time to upgrade or change
-settings without losing your tasks. Use `sudo bash setup.sh --uninstall` to
-remove it.
+settings: it refreshes the app and dependencies, preserves your tasks and
+**every variable already in `/opt/aria2-webui/.env`** (including custom ones),
+and restarts the service. Command-line options (`--host`, `--port`, `--rpc-url`,
+`--rpc-secret`) always take precedence over the saved config. Use
+`sudo bash setup.sh --uninstall` to remove it.
 
 ## Configuration
 
