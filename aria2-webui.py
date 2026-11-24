@@ -940,7 +940,7 @@ HTML_TEMPLATE = r"""
         }
 
         .schedule-row {
-            display:grid; grid-template-columns:minmax(230px,290px) 1fr;
+            display:grid; grid-template-columns:minmax(270px,280px) 1fr;
             gap:14px; align-items:end; margin-top:4px;
         }
         .schedule-row .field { margin-bottom:0; }
@@ -957,18 +957,18 @@ HTML_TEMPLATE = r"""
         }
         .time-input-group.editing { border-color:var(--violet); }
         .time-input-group input[type="time"] {
-            flex:1; min-width:0; min-height:0; height:100%;
+            flex:0 0 128px; min-width:0; min-height:0; height:100%;
             border:0; background:transparent;
-            padding:0 12px; font-family:var(--font-mono); font-size:var(--sm); line-height:1;
+            padding:0 4px 0 10px; font-family:var(--font-mono); font-size:var(--sm); line-height:1;
         }
         .time-input-group input[type="time"]:focus,
         .time-input-group input[type="time"]:focus-visible,
         .time-action:focus-visible { outline:none; }
         .time-action {
-            flex:0 0 auto; height:100%; display:inline-flex; align-items:center; justify-content:center; gap:6px;
+            flex:1; height:100%; display:inline-flex; align-items:center; justify-content:center; gap:6px;
             border:0; border-left:1px solid var(--border);
             background:var(--accent-tint); color:var(--accent);
-            padding:0 14px; font-size:var(--sm); font-weight:600; white-space:nowrap;
+            padding:0 18px; font-size:var(--sm); font-weight:600; white-space:nowrap;
         }
         .time-action .ico { font-size:1em; line-height:1; }
         .time-action:hover { background:var(--accent); color:var(--accent-text); }
@@ -1227,7 +1227,7 @@ HTML_TEMPLATE = r"""
             <label for="start_time">Start at</label>
             <div class="time-input-group" id="time-group">
                 <input type="time" id="start_time">
-                <button type="button" class="time-action" id="btn-schedule" onclick="submitTask('schedule')"><span class="ico">◷</span> Schedule</button>
+                <button type="button" class="time-action" id="btn-schedule" onclick="submitTask('schedule')">Schedule</button>
                 <button type="button" class="time-action time-action--save" id="btn-save" hidden onclick="saveEdit()"><span class="ico">✓</span> Save changes</button>
             </div>
         </div>
